@@ -86,7 +86,21 @@ def find_mbox_files(root: Path):
 # Message inspection helpers
 # --------------------------------------------------------------------------
 
-def decode_mime_header(raw: str) -> str:
+def hstr(value, default: str = "") -> str:
+    """Coerce a header value to a plain str.
+
+    email.message.Message.get() is documented to return a str, but on
+    certain malformed/folded encoded-word headers the compat32 policy
+    hands back an email.header.Header instance instead, which doesn't
+    support str methods like .lower(). Route everything through this.
+    """
+    if value is None:
+        return default
+    return str(value)
+
+
+def decode_mime_header(raw) -> str:
+    raw = hstr(raw)
     if not raw:
         return ""
     parts = decode_header(raw)
@@ -103,7 +117,7 @@ def decode_mime_header(raw: str) -> str:
 
 
 def get_message_datetime(msg: Message, fallback_mtime: float) -> datetime:
-    raw_date = msg.get("Date")
+    raw_date = hstr(msg.get("Date")) or None
     if raw_date:
         try:
             dt = parsedate_to_datetime(raw_date)
@@ -117,8 +131,8 @@ def get_message_datetime(msg: Message, fallback_mtime: float) -> datetime:
 
 
 def is_receipt(msg: Message, cfg: dict, strict: bool) -> bool:
-    from_header = (msg.get("From") or "").lower()
-    subject = decode_mime_header(msg.get("Subject") or "").lower()
+    from_header = hstr(msg.get("From")).lower()
+    subject = decode_mime_header(msg.get("Subject")).lower()
 
     sender_hit = any(pat in from_header for pat in cfg["sender_patterns"])
     subject_hit = any(kw in subject for kw in cfg["subject_keywords"])
@@ -151,7 +165,7 @@ def get_html_and_inline_images(msg: Message):
 
     for part in parts:
         content_type = part.get_content_type()
-        disposition = str(part.get("Content-Disposition") or "")
+        disposition = hstr(part.get("Content-Disposition"))
 
         if content_type == "text/html" and html is None and "attachment" not in disposition:
             payload = part.get_payload(decode=True)
@@ -162,7 +176,7 @@ def get_html_and_inline_images(msg: Message):
                 except (LookupError, TypeError):
                     html = payload.decode("utf-8", errors="replace")
 
-        cid = part.get("Content-ID")
+        cid = hstr(part.get("Content-ID"))
         if cid and content_type.startswith("image/"):
             payload = part.get_payload(decode=True)
             if payload:
@@ -316,13 +330,13 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
             if not is_receipt(msg, cfg, strict):
                 continue
 
-            msg_id = msg.get("Message-ID") or f"{mbox_path}:{key}"
+            msg_id = hstr(msg.get("Message-ID")) or f"{mbox_path}:{key}"
             if not force and msg_id in state:
                 log.debug("Already processed %s, skipping", msg_id)
                 continue
 
-            subject = decode_mime_header(msg.get("Subject") or "(no subject)")
-            from_header = msg.get("From") or "(unknown sender)"
+            subject = decode_mime_header(msg.get("Subject")) or "(no subject)"
+            from_header = hstr(msg.get("From")) or "(unknown sender)"
             dt = get_message_datetime(msg, mtime)
 
             html, cid_map = get_html_and_inline_images(msg)
