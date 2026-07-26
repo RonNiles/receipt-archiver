@@ -1,0 +1,44 @@
+{
+  "_comment": "Domains/addresses are matched against the From header (substring, case-insensitive). Subject keywords are matched against the Subject header (substring, case-insensitive). A message is treated as a receipt if it matches a sender pattern, OR if it matches a subject keyword AND comes from a domain that looks transactional (heuristic). You can freely add/remove entries.",
+
+  "sender_patterns": [
+    "squareup.com",
+    "square.com",
+    "toasttab.com",
+    "clover.com",
+    "shopify.com",
+    "shopifyemail.com",
+    "stripe.com",
+    "sumup.com",
+    "lightspeedhq.com",
+    "revelsystems.com",
+    "heartland.us",
+    "paypal.com",
+    "block.xyz",
+    "cash.app",
+    "vend-hq.com",
+    "touchbistro.com",
+    "loyverse.com",
+    "ordermark.com",
+    "chownow.com",
+    "grubhub.com",
+    "doordash.com",
+    "ubereats.com",
+    "olo.com"
+  ],
+
+  "subject_keywords": [
+    "receipt",
+    "your receipt",
+    "payment receipt",
+    "order confirmation",
+    "here's your receipt",
+    "thanks for your order",
+    "your order from",
+    "purchase confirmation",
+    "your invoice",
+    "transaction receipt"
+  ],
+
+  "require_html_body": true
+}
