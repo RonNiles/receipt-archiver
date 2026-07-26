@@ -24,6 +24,7 @@ Requires: beautifulsoup4, lxml, weasyprint, pikepdf
 """
 
 import argparse
+import binascii
 import hashlib
 import json
 import logging
@@ -32,6 +33,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+from email.errors import HeaderParseError
 from email.header import decode_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
@@ -103,7 +105,16 @@ def decode_mime_header(raw) -> str:
     raw = hstr(raw)
     if not raw:
         return ""
-    parts = decode_header(raw)
+    try:
+        parts = decode_header(raw)
+    except (HeaderParseError, ValueError, binascii.Error) as e:
+        # Real-world mail sometimes has malformed encoded-words (bad base64
+        # padding, truncated quoted-printable, etc). decode_header() raises
+        # on these instead of degrading gracefully -- fall back to the raw
+        # header text rather than aborting the whole scan over one bad
+        # header.
+        log.debug("Malformed MIME header %r (%s); using raw text", raw[:80], e)
+        return raw
     out = []
     for text, enc in parts:
         if isinstance(text, bytes):
@@ -327,41 +338,45 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 log.warning("Skipping unreadable message in %s (key %s): %s", mbox_path, key, e)
                 continue
 
-            if not is_receipt(msg, cfg, strict):
-                continue
-
-            msg_id = hstr(msg.get("Message-ID")) or f"{mbox_path}:{key}"
-            if not force and msg_id in state:
-                log.debug("Already processed %s, skipping", msg_id)
-                continue
-
-            subject = decode_mime_header(msg.get("Subject")) or "(no subject)"
-            from_header = hstr(msg.get("From")) or "(unknown sender)"
-            dt = get_message_datetime(msg, mtime)
-
-            html, cid_map = get_html_and_inline_images(msg)
-            if html is None:
-                log.info("MATCH (no HTML body, skipped) | %s | %s | %s", dt.isoformat(), from_header, subject)
-                continue
-
-            log.info("MATCH | %s | %s | %s", dt.isoformat(), from_header, subject)
-            count += 1
-
-            if dry_run:
-                continue
-
-            cleaned = clean_html(html, cid_map, strip_remote_images)
-            out_path = build_output_path(out_root, dt, from_header, subject, msg_id)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
             try:
-                render_pdf(cleaned, out_path)
-                stamp_pdf_metadata(out_path, dt, subject, from_header)
-            except Exception as e:  # noqa: BLE001
-                log.error("Failed to render/stamp %s: %s", out_path, e)
-                continue
+                if not is_receipt(msg, cfg, strict):
+                    continue
 
-            state[msg_id] = str(out_path)
+                msg_id = hstr(msg.get("Message-ID")) or f"{mbox_path}:{key}"
+                if not force and msg_id in state:
+                    log.debug("Already processed %s, skipping", msg_id)
+                    continue
+
+                subject = decode_mime_header(msg.get("Subject")) or "(no subject)"
+                from_header = hstr(msg.get("From")) or "(unknown sender)"
+                dt = get_message_datetime(msg, mtime)
+
+                html, cid_map = get_html_and_inline_images(msg)
+                if html is None:
+                    log.info("MATCH (no HTML body, skipped) | %s | %s | %s", dt.isoformat(), from_header, subject)
+                    continue
+
+                log.info("MATCH | %s | %s | %s", dt.isoformat(), from_header, subject)
+                count += 1
+
+                if dry_run:
+                    continue
+
+                cleaned = clean_html(html, cid_map, strip_remote_images)
+                out_path = build_output_path(out_root, dt, from_header, subject, msg_id)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    render_pdf(cleaned, out_path)
+                    stamp_pdf_metadata(out_path, dt, subject, from_header)
+                except Exception as e:  # noqa: BLE001
+                    log.error("Failed to render/stamp %s: %s", out_path, e)
+                    continue
+
+                state[msg_id] = str(out_path)
+            except Exception as e:  # noqa: BLE001 - one weird message must never abort the whole scan
+                log.error("Unexpected error processing message in %s (key %s): %s", mbox_path, key, e)
+                continue
     finally:
         box.close()
     return count
