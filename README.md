@@ -77,66 +77,34 @@ second condition exists so a random newsletter that happens to say "receipt"
 in its subject doesn't get swept in. Edit `senders.json` freely to tune this
 for your own inbox -- it's a plain JSON file, no code changes needed.
 
-## Live-rendering the hosted receipt page (e.g. squareup.com/r/...)
+## Live-rendering a linked hosted receipt page (currently unused)
 
-Many Square receipt emails are a thin wrapper around a link like:
+Some POS emails are a thin wrapper around a "view your full receipt" link to
+a hosted page. There's a mechanism for loading that page in a real headless
+browser and printing it instead of the email's own HTML -- see
+`render_live_receipt_pdf()` and the `--live-render` / `--test-live-url`
+flags -- but it's currently **inactive**: `live_receipt_link_patterns` in
+`senders.json` is empty.
 
+It was originally used for Square's `squareup.com/r/...` links, since their
+hosted receipt page looked better than the raw email. That's no longer
+needed now that email HTML renders through Chromium (see above) -- the
+email's own HTML looks right on its own, and fetching a separate hosted page
+for just one vendor made those receipts look visibly different from every
+other receipt in the archive (different layout/branding chrome from
+Square's site rather than the restaurant's own email template).
+
+If you run into a specific vendor whose email HTML still renders worse than
+its hosted receipt page, you can turn this back on by adding a regex to
+`live_receipt_link_patterns`, e.g.:
+```json
+"live_receipt_link_patterns": [
+  "https?://squareup\\.com/r/[A-Za-z0-9]+"
+]
 ```
-View your full receipt:
-https://squareup.com/r/arvZNgpgkI6hJLltqJ9vVT6wp1JJZZY
-```
-
-...and that hosted page is a much cleaner, better-formatted version of the
-receipt than the email itself. By default, when a matched receipt's body
-contains a link matching one of the `live_receipt_link_patterns` in
-`senders.json`, the tool loads that page in a real headless browser and
-prints *that* to PDF instead of the email's HTML -- including small images
-like logos (`print_background=True` keeps CSS background images too).
-
-This needs a real browser (not just an HTTP fetch) because these hosted
-receipt pages are client-side rendered -- Square's own developer forum
-confirms that a plain `curl`/HTTP client on the `receipt_url` gets back an
-empty shell; a browser is required to run the JS that fills it in. That's
-why this uses Playwright (https://playwright.dev/) + headless Chromium
-rather than a simple HTTP GET.
-
-**Setup:**
-```bash
-pip3 install --break-system-packages playwright
-playwright install chromium
-# if that complains about missing system libraries:
-playwright install --with-deps chromium
-```
-
-**How it behaves:**
-- Hyperlinks are stripped directly in the live page's DOM before printing
-  (every `<a>` is replaced with a plain `<span>` of its text), so the PDF has
-  no clickable links, same as the email-HTML path.
-- As an extra safety net, *every* PDF this tool writes -- whether from the
-  live page or the email HTML -- has any `/Link` annotations stripped after
-  the fact, in case a renderer ever adds one some other way.
-- If the page fails to load, times out, or renders suspiciously little text
-  (a decent signal the site blocked the headless browser, the link expired,
-  or the page needed more time to hydrate -- the tool already waits a few
-  extra seconds past initial network-idle for this), it logs a warning and
-  automatically falls back to rendering the email's own HTML, same as before
-  this feature existed. A live-render failure never causes a receipt to be
-  skipped as long as the email itself had an HTML body.
-- If `playwright` isn't installed at all, you'll get one clear warning at
-  startup and every match will use the email-HTML path -- nothing breaks.
-
-**Testing before a big run:** rather than running the whole archive, sanity
-check the pipeline against one real link first:
-```bash
-python3 receipt_archiver.py --test-live-url "https://squareup.com/r/XXXXXXXX" -o ./test.pdf
-```
-This loads that one URL, strips links, prints to PDF, and exits -- tells you
-immediately whether Square is letting the headless browser through, and lets
-you eyeball the output before committing to hundreds of files.
-
-Since these hosted pages are third-party and can change their layout, block
-headless browsers, or expire links over time, treat this as best-effort: the
-guaranteed fallback is what makes it safe to leave on by default.
+Everything described above (link stripped from the live DOM before
+printing, automatic fallback to email HTML on any failure, `--test-live-url`
+for testing a single link) still works exactly as before if you do.
 
 ## Notes / edge cases handled
 
