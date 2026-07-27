@@ -40,5 +40,10 @@
     "transaction receipt"
   ],
 
+  "_live_receipt_comment": "If an email body contains a link matching one of these patterns, receipt_archiver can optionally load that page in a real (headless) browser and render THAT page to PDF instead of the email's own HTML -- useful for POS emails that are mostly a thin wrapper around a 'view your full receipt' link. Requires the 'playwright' package and 'playwright install chromium'. See --live-render / --no-live-render.",
+  "live_receipt_link_patterns": [
+    "https?://squareup\\.com/r/[A-Za-z0-9]+"
+  ],
+
   "require_html_body": true
 }

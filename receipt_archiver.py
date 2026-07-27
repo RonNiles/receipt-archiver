@@ -53,8 +53,10 @@ def load_config(path: Path) -> dict:
         cfg = json.load(fh)
     cfg.setdefault("sender_patterns", [])
     cfg.setdefault("subject_keywords", [])
+    cfg.setdefault("live_receipt_link_patterns", [])
     cfg["sender_patterns"] = [s.lower() for s in cfg["sender_patterns"]]
     cfg["subject_keywords"] = [s.lower() for s in cfg["subject_keywords"]]
+    cfg["live_receipt_link_res"] = [re.compile(p) for p in cfg["live_receipt_link_patterns"]]
     return cfg
 
 
@@ -199,6 +201,37 @@ def get_html_and_inline_images(msg: Message):
     return html, cid_map
 
 
+def get_all_text_content(msg: Message) -> str:
+    """Concatenate every text/plain and text/html part's decoded content.
+    Used only for scanning for a 'full receipt' link -- not for rendering."""
+    chunks = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.get_content_type() in ("text/plain", "text/html"):
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                chunks.append(payload.decode(charset, errors="replace"))
+            except (LookupError, TypeError):
+                chunks.append(payload.decode("utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+
+def find_live_receipt_url(msg: Message, live_link_res):
+    """If the message body contains a link matching one of the configured
+    'live_receipt_link_patterns', return the first match. Otherwise None."""
+    if not live_link_res:
+        return None
+    text = get_all_text_content(msg)
+    for pattern in live_link_res:
+        m = pattern.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
 # --------------------------------------------------------------------------
 # HTML cleanup: inline cid: images, strip hyperlinks, drop remote trackers
 # --------------------------------------------------------------------------
@@ -237,6 +270,132 @@ def clean_html(html: str, cid_map: dict, strip_remote_images: bool) -> str:
                 del tag[attr]
 
     return str(soup)
+
+
+# --------------------------------------------------------------------------
+# Live rendering: load the linked hosted receipt page in a real headless
+# browser (needed because pages like squareup.com/r/... are client-side
+# rendered -- a plain HTTP fetch returns an empty shell) and print that page
+# to PDF instead of the email's own HTML.
+# --------------------------------------------------------------------------
+
+class LiveRenderError(Exception):
+    """Raised for any failure in the live-render path; callers should catch
+    this (and only this) to decide whether to fall back to the email's own
+    HTML, since it means 'this didn't work', not 'something is broken'."""
+
+
+_LIVE_RENDER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
+                             min_text_chars: int = 40):
+    """Load `url` in headless Chromium, strip hyperlinks directly in the
+    live DOM (so the exported PDF has none, regardless of whether the site's
+    printed output would otherwise carry link annotations), then print the
+    page to `out_path`.
+
+    Raises LiveRenderError on any failure (missing playwright/browser,
+    navigation failure, or a page that rendered suspiciously little text --
+    which usually means the site blocked the headless browser or the link
+    had expired). Callers should catch LiveRenderError and fall back to
+    rendering the email's own HTML instead.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, Error as PWError, TimeoutError as PWTimeout
+    except ImportError as e:
+        raise LiveRenderError(
+            "playwright is not installed; run "
+            "'pip install --break-system-packages playwright && playwright install chromium' "
+            "or use --no-live-render"
+        ) from e
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+            except PWError as e:
+                raise LiveRenderError(
+                    f"could not launch chromium ({e}); run 'playwright install chromium'"
+                ) from e
+
+            try:
+                context = browser.new_context(user_agent=_LIVE_RENDER_UA)
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                except PWTimeout as e:
+                    raise LiveRenderError(f"timed out loading {url}: {e}") from e
+                except PWError as e:
+                    raise LiveRenderError(f"navigation failed for {url}: {e}") from e
+
+                body_text = page.inner_text("body") if page.query_selector("body") else ""
+                if len(body_text.strip()) < min_text_chars:
+                    # networkidle only waits on network activity; some pages
+                    # finish hydrating slightly after that (a JS timer, a
+                    # requestIdleCallback, etc. with no further network
+                    # calls). Give it a little more time before giving up.
+                    for _ in range(10):
+                        page.wait_for_timeout(300)
+                        body_text = page.inner_text("body") if page.query_selector("body") else ""
+                        if len(body_text.strip()) >= min_text_chars:
+                            break
+
+                if len(body_text.strip()) < min_text_chars:
+                    raise LiveRenderError(
+                        f"page rendered almost no text ({len(body_text.strip())} chars) -- "
+                        "likely blocked, expired, or requires JS this browser didn't run"
+                    )
+
+                # Unwrap every <a> in the live DOM before printing, so the
+                # exported PDF has no clickable link constructs at all.
+                page.evaluate(
+                    """() => {
+                        document.querySelectorAll('a').forEach(a => {
+                            const span = document.createElement('span');
+                            span.textContent = a.textContent;
+                            a.replaceWith(span);
+                        });
+                    }"""
+                )
+
+                page.emulate_media(media="print")
+                page.pdf(path=str(out_path), print_background=True)
+            finally:
+                browser.close()
+    except LiveRenderError:
+        raise
+    except Exception as e:  # noqa: BLE001 - any other playwright/OS surprise
+        raise LiveRenderError(f"unexpected error rendering {url}: {e}") from e
+
+    if not out_path.exists() or out_path.stat().st_size < 500:
+        raise LiveRenderError(f"output PDF for {url} is missing or suspiciously small")
+
+
+def strip_pdf_link_annotations(pdf_path: Path):
+    """Remove any clickable link annotations from an already-written PDF.
+    Belt-and-suspenders: the email-HTML path never has <a> tags left by the
+    time it reaches the renderer, and the live-render path already unwraps
+    them in the DOM, but this guarantees no PDF this tool writes can carry a
+    clickable /Link annotation regardless of how it was produced."""
+    import pikepdf
+    with pikepdf.open(str(pdf_path), allow_overwriting_input=True) as pdf:
+        changed = False
+        for page in pdf.pages:
+            if "/Annots" not in page:
+                continue
+            kept = [a for a in page["/Annots"] if a.get("/Subtype") != "/Link"]
+            if len(kept) != len(page["/Annots"]):
+                changed = True
+                if kept:
+                    page["/Annots"] = kept
+                else:
+                    del page["/Annots"]
+        if changed:
+            pdf.save(str(pdf_path))
 
 
 # --------------------------------------------------------------------------
@@ -326,7 +485,7 @@ def save_state(path: Path, state: dict):
 
 def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                        strict: bool, dry_run: bool, strip_remote_images: bool,
-                       force: bool) -> int:
+                       force: bool, live_render: bool, live_render_timeout_ms: int) -> int:
     count = 0
     box = mailbox.mbox(str(mbox_path), factory=None, create=False)
     try:
@@ -352,7 +511,10 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 dt = get_message_datetime(msg, mtime)
 
                 html, cid_map = get_html_and_inline_images(msg)
-                if html is None:
+
+                live_url = find_live_receipt_url(msg, cfg["live_receipt_link_res"]) if live_render else None
+
+                if html is None and live_url is None:
                     log.info("MATCH (no HTML body, skipped) | %s | %s | %s", dt.isoformat(), from_header, subject)
                     continue
 
@@ -362,15 +524,35 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 if dry_run:
                     continue
 
-                cleaned = clean_html(html, cid_map, strip_remote_images)
                 out_path = build_output_path(out_root, dt, from_header, subject, msg_id)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
+                rendered = False
+                if live_url:
+                    try:
+                        log.info("  live-rendering %s", live_url)
+                        render_live_receipt_pdf(live_url, out_path, timeout_ms=live_render_timeout_ms)
+                        rendered = True
+                    except LiveRenderError as e:
+                        log.warning("  live render failed (%s), falling back to email HTML", e)
+
+                if not rendered:
+                    if html is None:
+                        log.error("  no email HTML to fall back to for %s, skipping", msg_id)
+                        continue
+                    try:
+                        cleaned = clean_html(html, cid_map, strip_remote_images)
+                        render_pdf(cleaned, out_path)
+                        rendered = True
+                    except Exception as e:  # noqa: BLE001
+                        log.error("Failed to render %s: %s", out_path, e)
+                        continue
+
                 try:
-                    render_pdf(cleaned, out_path)
+                    strip_pdf_link_annotations(out_path)
                     stamp_pdf_metadata(out_path, dt, subject, from_header)
                 except Exception as e:  # noqa: BLE001
-                    log.error("Failed to render/stamp %s: %s", out_path, e)
+                    log.error("Failed to finalize %s: %s", out_path, e)
                     continue
 
                 state[msg_id] = str(out_path)
@@ -384,11 +566,13 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", "-i", required=True, type=Path,
+    ap.add_argument("--input", "-i", type=Path,
                      help="Root directory to scan for Thunderbird mbox archive files "
-                          "(e.g. .../Archive.sbd)")
-    ap.add_argument("--output", "-o", required=True, type=Path,
-                     help="Directory to write PDFs into (organized as YYYY/MM/)")
+                          "(e.g. .../Archive.sbd). Required unless --test-live-url is used.")
+    ap.add_argument("--output", "-o", type=Path,
+                     help="Directory to write PDFs into (organized as YYYY/MM/). Required "
+                          "unless --test-live-url is used (in which case it's an optional "
+                          "output file/dir for the single test PDF).")
     ap.add_argument("--config", "-c", type=Path, default=DEFAULT_CONFIG,
                      help=f"Path to sender/subject config JSON (default: {DEFAULT_CONFIG})")
     ap.add_argument("--state-file", type=Path, default=None,
@@ -403,6 +587,24 @@ def main():
     ap.add_argument("--keep-remote-images", action="store_true",
                      help="Do not strip remote (http/https) <img> tags. By default these "
                           "are removed to avoid tracking pixels and network dependence.")
+    ap.add_argument("--live-render", dest="live_render", action="store_true", default=True,
+                     help="For matched receipts containing a link matching "
+                          "live_receipt_link_patterns (e.g. squareup.com/r/...), load that "
+                          "page in a real headless browser and render IT to PDF instead of "
+                          "the email's own HTML. Falls back to the email HTML automatically "
+                          "if the live render fails for any reason. Requires playwright "
+                          "(pip install playwright && playwright install chromium). On by "
+                          "default.")
+    ap.add_argument("--no-live-render", dest="live_render", action="store_false",
+                     help="Disable live rendering; always use the email's own HTML.")
+    ap.add_argument("--live-render-timeout", type=int, default=20000,
+                     help="Milliseconds to wait for the live receipt page to load (default: 20000)")
+    ap.add_argument("--test-live-url", metavar="URL",
+                     help="Debug helper: render a single URL through the live-render "
+                          "pipeline (headless browser, strip links, print to PDF) and exit. "
+                          "Use this to sanity-check the feature against a real receipt link "
+                          "before running it over your whole archive. Combine with --output "
+                          "to choose where the test PDF is written.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -413,6 +615,33 @@ def main():
     )
     for noisy in ("fontTools", "weasyprint"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    if args.test_live_url:
+        out_path = (args.output if args.output else Path("live_render_test.pdf"))
+        if out_path.is_dir() or not out_path.suffix:
+            out_path = out_path / "live_render_test.pdf"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            render_live_receipt_pdf(args.test_live_url, out_path, timeout_ms=args.live_render_timeout)
+        except LiveRenderError as e:
+            log.error("Live render test FAILED: %s", e)
+            sys.exit(1)
+        strip_pdf_link_annotations(out_path)
+        log.info("Live render test OK -> %s", out_path)
+        return
+
+    if not args.input or not args.output:
+        ap.error("--input and --output are required (unless using --test-live-url)")
+
+    if args.live_render:
+        try:
+            import playwright.sync_api  # noqa: F401
+        except ImportError:
+            log.warning(
+                "--live-render is on but playwright isn't installed; every matched receipt "
+                "will fall back to email-HTML rendering. Run 'pip install --break-system-packages "
+                "playwright && playwright install chromium', or pass --no-live-render to silence this."
+            )
 
     if not args.input.exists():
         log.error("Input path does not exist: %s", args.input)
@@ -434,6 +663,8 @@ def main():
             dry_run=args.dry_run,
             strip_remote_images=not args.keep_remote_images,
             force=args.force,
+            live_render=args.live_render,
+            live_render_timeout_ms=args.live_render_timeout,
         )
 
     if not args.dry_run:
