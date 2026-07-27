@@ -77,34 +77,63 @@ second condition exists so a random newsletter that happens to say "receipt"
 in its subject doesn't get swept in. Edit `senders.json` freely to tune this
 for your own inbox -- it's a plain JSON file, no code changes needed.
 
-## Live-rendering a linked hosted receipt page (currently unused)
+## Live-rendering a linked hosted receipt page
 
-Some POS emails are a thin wrapper around a "view your full receipt" link to
-a hosted page. There's a mechanism for loading that page in a real headless
-browser and printing it instead of the email's own HTML -- see
-`render_live_receipt_pdf()` and the `--live-render` / `--test-live-url`
-flags -- but it's currently **inactive**: `live_receipt_link_patterns` in
-`senders.json` is empty.
+Some POS emails are a thin wrapper around a "view your full receipt" link
+to a hosted page -- sometimes because the email itself just looks worse
+than the hosted page, sometimes (like Clover) because the email genuinely
+has no line-item detail at all and only the linked page does. When a
+matched receipt's body contains a link matching one of the
+`live_receipt_link_patterns` regexes in `senders.json`, the tool loads that
+page in a real headless browser and prints *that* to PDF instead of the
+email's own HTML.
 
-It was originally used for Square's `squareup.com/r/...` links, since their
-hosted receipt page looked better than the raw email. That's no longer
-needed now that email HTML renders through Chromium (see above) -- the
-email's own HTML looks right on its own, and fetching a separate hosted page
-for just one vendor made those receipts look visibly different from every
-other receipt in the archive (different layout/branding chrome from
-Square's site rather than the restaurant's own email template).
+**Currently configured:** a SendGrid click-tracking pattern
+(`u<digits>.ct.sendgrid.net/ls/click?...`), which covers Clover's "full
+transaction receipt" link and any other vendor that routes its receipt link
+through SendGrid the same way. These are redirect links -- SendGrid logs
+the click, then 302s to the vendor's actual hosted page -- and Playwright
+follows redirects automatically, so no special handling was needed for
+that part. Worth knowing: clicking through does mean SendGrid/the vendor
+logs that you opened and clicked the link, same tradeoff as fetching
+remote images (see above).
 
-If you run into a specific vendor whose email HTML still renders worse than
-its hosted receipt page, you can turn this back on by adding a regex to
-`live_receipt_link_patterns`, e.g.:
-```json
-"live_receipt_link_patterns": [
-  "https?://squareup\\.com/r/[A-Za-z0-9]+"
-]
+One wrinkle specific to plain-text email bodies: long URLs often get
+hard-wrapped (or soft-wrapped per RFC 3676 format=flowed, with a trailing
+space before the line break) across two lines, which would otherwise break
+matching mid-URL. The link finder handles this by also searching a
+whitespace-collapsed copy of the body -- safe to do since URLs never
+legitimately contain whitespace, so this can only help reassemble a
+wrapped link, never cause a false match elsewhere in the email.
+
+Square's `squareup.com/r/...` links used to be handled this way too, but
+were removed once email HTML started rendering through Chromium (see
+above) -- the email's own HTML looked right on its own at that point, and
+fetching Square's separate hosted page made those receipts look visibly
+different (different branding/chrome) from everything else in the archive.
+If you run into another vendor whose email HTML is genuinely missing
+detail like Clover's, add a regex for its link to
+`live_receipt_link_patterns` the same way.
+
+**How it behaves:**
+- Hyperlinks are stripped directly in the live page's DOM before printing,
+  so the PDF has no clickable links, same as the email-HTML path.
+- The same single-page Legal-size fitting (see below) applies to
+  live-rendered pages too.
+- If the page fails to load, times out, or renders suspiciously little text
+  (blocked, expired link, or slow to hydrate), it logs a warning and
+  automatically falls back to rendering the email's own HTML. A live-render
+  failure never causes a receipt to be skipped as long as the email itself
+  had an HTML body.
+- If `playwright` isn't installed at all, you get one clear warning at
+  startup and every match uses the email-HTML path -- nothing breaks.
+
+**Testing before a big run:** sanity-check the pipeline against one real
+link first, rather than running the whole archive:
+```bash
+python3 receipt_archiver.py --test-live-url "PASTE_THE_FULL_LINK_HERE" -o ./test.pdf
 ```
-Everything described above (link stripped from the live DOM before
-printing, automatic fallback to email HTML on any failure, `--test-live-url`
-for testing a single link) still works exactly as before if you do.
+This loads that one URL, strips links, prints to PDF, and exits.
 
 ## Page sizing (single page, no near-empty overflow page)
 
@@ -142,3 +171,49 @@ For each receipt, the tool measures the actual rendered content height and:
   CreationDate/ModDate (same instant, just expressed with the render
   machine's local UTC offset -- this doesn't change *when* the receipt was
   sent, only how the offset is written).
+
+## review_receipts.py -- pruning receipts after the fact
+
+A separate companion script for walking back through generated PDFs
+(usually somewhere under `~/receipts`) and deciding, one at a time, whether
+to keep or delete each one.
+
+```bash
+python3 review_receipts.py ~/receipts
+```
+
+For each PDF it prints a quick preview right in the terminal (title,
+creation date, a snippet of extracted text) and opens the file in your
+system's default PDF viewer (`xdg-open` on Linux), then prompts:
+
+```
+[Enter=keep] [d]elete [o]pen [s]kip [q]uit >
+```
+
+- **Enter / k** -- keep it, move to the next
+- **d** -- delete it. Goes to the system trash (`gio trash`, recoverable
+  the normal way you'd recover anything from Trash) by default; pass
+  `--permanent-delete` to actually remove the file instead.
+- **o** -- (re)open it in the viewer, if you closed the window or want
+  another look
+- **s** -- skip for now without recording a decision
+- **q** -- quit; progress is saved automatically
+
+**Resuming a long review:** decisions are recorded in
+`<root>/.review_state.json` as you go. Run with `--resume` to skip anything
+already decided on in a prior run and pick up where you left off:
+```bash
+python3 review_receipts.py ~/receipts --resume
+```
+Without `--resume`, every run reviews everything found, from scratch
+(harmless for files you already decided to keep -- you'll just see them
+again).
+
+**Other flags:**
+- `--no-auto-open` -- skip launching the viewer automatically; just read the
+  terminal preview, and press `o` if you want to actually open one
+- `--viewer CMD` -- use a specific viewer instead of the system default,
+  e.g. `--viewer evince` or `--viewer okular`
+- `--sort mtime` -- review oldest-created-file-first instead of the default
+  path order (which follows the `YYYY/MM` layout `receipt_archiver.py`
+  produces)

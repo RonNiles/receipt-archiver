@@ -221,12 +221,26 @@ def get_all_text_content(msg: Message) -> str:
 
 def find_live_receipt_url(msg: Message, live_link_res):
     """If the message body contains a link matching one of the configured
-    'live_receipt_link_patterns', return the first match. Otherwise None."""
+    'live_receipt_link_patterns', return the first match. Otherwise None.
+
+    Plain-text email bodies commonly hard-wrap long lines (and
+    format=flowed bodies soft-wrap with a trailing space before the
+    newline), which can split a long URL across two lines. Matching against
+    the raw text would miss that, so this also tries a whitespace-collapsed
+    copy of the text -- safe to do because URLs never legitimately contain
+    whitespace, so collapsing it can only help reassemble a wrapped URL, and
+    can't turn unrelated prose into a false positive (the patterns all
+    require a specific https?://... prefix).
+    """
     if not live_link_res:
         return None
     text = get_all_text_content(msg)
+    collapsed = re.sub(r"\s+", "", text)
     for pattern in live_link_res:
         m = pattern.search(text)
+        if m:
+            return m.group(0)
+        m = pattern.search(collapsed)
         if m:
             return m.group(0)
     return None
