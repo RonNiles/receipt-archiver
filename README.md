@@ -106,6 +106,25 @@ Everything described above (link stripped from the live DOM before
 printing, automatic fallback to email HTML on any failure, `--test-live-url`
 for testing a single link) still works exactly as before if you do.
 
+## Page sizing (single page, no near-empty overflow page)
+
+Output PDFs use Legal-size pages (8.5 x 14in) sized to fit each receipt on
+exactly one page, instead of a fixed Letter page that could split a receipt
+across two pages (with the second page holding just a line or two -- the
+original motivation for this).
+
+For each receipt, the tool measures the actual rendered content height and:
+- If it fits within one Legal page, the page is sized exactly to the
+  content (no wasted trailing blank space, no fixed 14in page for a 2in
+  receipt).
+- If it's taller than one Legal page, the content is scaled down (a uniform
+  print zoom, not a re-layout) just enough to fit within 14in.
+- In the rare case a receipt is so long that even a substantial scale-down
+  (down to 40%) wouldn't make it fit legibly, the page is allowed to grow
+  taller than 14in instead of shrinking further -- so output is always a
+  single page, even if that means it's technically not Legal-sized in that
+  edge case.
+
 ## Notes / edge cases handled
 
 - Inline images referenced via `cid:` (common for receipt logos) are resolved

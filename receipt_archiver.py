@@ -321,6 +321,81 @@ class LiveRenderError(Exception):
     HTML, since it means 'this didn't work', not 'something is broken'."""
 
 
+# --------------------------------------------------------------------------
+# Fit-to-one-page PDF output.
+#
+# Chromium's page.pdf() paginates like a real print job: content taller than
+# one page spills onto a second (often nearly-empty) page. Receipts are
+# usually shorter than a Legal-size sheet, so using Legal instead of Letter
+# already avoids most of that; for the rare receipt still too long, we
+# measure its actual rendered height and shrink it (Chromium's print
+# "scale" factor -- a uniform zoom, not a re-layout) just enough to fit
+# within one Legal page, rather than letting it spill onto a second page.
+# --------------------------------------------------------------------------
+
+LEGAL_WIDTH_IN = 8.5
+LEGAL_MAX_HEIGHT_IN = 14.0
+PDF_MARGIN_IN = 0.25
+CSS_PX_PER_IN = 96
+# Chromium clamps print scale to [0.1, 2]. We use a higher floor than that
+# so content doesn't shrink into illegibility -- past this point we let the
+# page grow taller than Legal size instead of shrinking further, so output
+# is still always a single page, just not always Legal-sized in the most
+# extreme cases (a receipt with an enormous number of line items, say).
+MIN_PRINT_SCALE = 0.4
+
+
+def _legal_page_viewport() -> dict:
+    """Viewport sized to the printable width of a Legal page (width minus
+    margins), so what we measure for content height matches what will
+    actually be laid out when printed -- and so responsive/media-query CSS
+    in the email sees the same width in both steps. Height is kept small on
+    purpose: browsers generally report document.documentElement.scrollHeight
+    as at least the viewport height, so a tall initial viewport would make
+    every short receipt measure as artificially tall."""
+    printable_width_in = LEGAL_WIDTH_IN - 2 * PDF_MARGIN_IN
+    return {"width": round(printable_width_in * CSS_PX_PER_IN), "height": 100}
+
+
+def _print_fit_to_one_legal_page(page, out_path: Path):
+    """Print `page`'s already-loaded content to a single Legal-size PDF
+    page, shrinking it (never enlarging) just enough that it doesn't spill
+    onto a second page."""
+    page.emulate_media(media="print")
+    content_height_px = page.evaluate("document.documentElement.scrollHeight")
+    content_height_in = content_height_px / CSS_PX_PER_IN
+    printable_height_in = LEGAL_MAX_HEIGHT_IN - 2 * PDF_MARGIN_IN
+
+    scale = 1.0
+    if content_height_in > printable_height_in:
+        scale = printable_height_in / content_height_in
+        if scale < MIN_PRINT_SCALE:
+            log.debug(
+                "content is %.1fin tall -- even at the minimum print scale "
+                "(%.2f) it won't fit a %.1fin Legal page; letting the page "
+                "grow taller instead so it still comes out as one page",
+                content_height_in, MIN_PRINT_SCALE, printable_height_in,
+            )
+            scale = MIN_PRINT_SCALE
+
+    page_height_in = (content_height_in * scale) + 2 * PDF_MARGIN_IN
+    log.debug("fit-to-page: content=%.2fin scale=%.2f page_height=%.2fin",
+              content_height_in, scale, page_height_in)
+
+    page.pdf(
+        path=str(out_path),
+        print_background=True,
+        prefer_css_page_size=False,
+        width=f"{LEGAL_WIDTH_IN}in",
+        height=f"{page_height_in}in",
+        scale=scale,
+        margin={
+            "top": f"{PDF_MARGIN_IN}in", "bottom": f"{PDF_MARGIN_IN}in",
+            "left": f"{PDF_MARGIN_IN}in", "right": f"{PDF_MARGIN_IN}in",
+        },
+    )
+
+
 _LIVE_RENDER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -359,7 +434,7 @@ def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
                 ) from e
 
             try:
-                context = browser.new_context(user_agent=_LIVE_RENDER_UA)
+                context = browser.new_context(user_agent=_LIVE_RENDER_UA, viewport=_legal_page_viewport())
                 page = context.new_page()
                 try:
                     page.goto(url, wait_until="networkidle", timeout=timeout_ms)
@@ -399,7 +474,7 @@ def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
                 )
 
                 page.emulate_media(media="print")
-                page.pdf(path=str(out_path), print_background=True, prefer_css_page_size=True)
+                _print_fit_to_one_legal_page(page, out_path)
             finally:
                 browser.close()
     except LiveRenderError:
@@ -491,7 +566,7 @@ def _render_html_via_chromium(html: str, out_path: Path, timeout_ms: int = 20000
             except PWError as e:
                 raise LiveRenderError(f"could not launch chromium ({e})") from e
             try:
-                page = browser.new_page()
+                page = browser.new_page(viewport=_legal_page_viewport())
                 try:
                     page.set_content(html, wait_until="networkidle", timeout=timeout_ms)
                 except PWTimeout as e:
@@ -499,7 +574,7 @@ def _render_html_via_chromium(html: str, out_path: Path, timeout_ms: int = 20000
                 except PWError as e:
                     raise LiveRenderError(f"failed to render HTML: {e}") from e
                 page.emulate_media(media="print")
-                page.pdf(path=str(out_path), print_background=True, prefer_css_page_size=True)
+                _print_fit_to_one_legal_page(page, out_path)
             finally:
                 browser.close()
     except LiveRenderError:
