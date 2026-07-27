@@ -236,6 +236,35 @@ def find_live_receipt_url(msg: Message, live_link_res):
 # HTML cleanup: inline cid: images, strip hyperlinks, drop remote trackers
 # --------------------------------------------------------------------------
 
+def _looks_like_tracking_pixel(img) -> bool:
+    """Heuristic for actual tracking pixels (as opposed to real content
+    images like logos): explicit 0/1px dimensions, or common
+    tracker/beacon naming in class/id/src."""
+    def _px(val):
+        if val is None:
+            return None
+        try:
+            return int(re.sub(r"[^\d]", "", str(val)) or -1)
+        except ValueError:
+            return None
+
+    w, h = _px(img.get("width")), _px(img.get("height"))
+    if (w is not None and w <= 1) or (h is not None and h <= 1):
+        return True
+
+    style = (img.get("style") or "").lower()
+    if re.search(r"width\s*:\s*[01]px|height\s*:\s*[01]px", style):
+        return True
+
+    haystack = " ".join([
+        img.get("class") and " ".join(img.get("class")) or "",
+        img.get("id") or "",
+        img.get("src") or "",
+        img.get("alt") or "",
+    ]).lower()
+    return any(m in haystack for m in ("track", "beacon", "pixel.gif", "open.gif", "spacer.gif"))
+
+
 def clean_html(html: str, cid_map: dict, strip_remote_images: bool) -> str:
     from bs4 import BeautifulSoup
 
@@ -250,12 +279,19 @@ def clean_html(html: str, cid_map: dict, strip_remote_images: bool) -> str:
                 img["src"] = cid_map[cid]
             else:
                 img.decompose()
-        elif strip_remote_images and src.startswith(("http://", "https://")):
-            # Most remote images in receipt emails are tracking pixels or
-            # logos hotlinked from the sender's CDN; drop them so the PDF
-            # doesn't depend on network access and doesn't leak a read
-            # receipt when later opened.
-            img.decompose()
+        elif src.startswith(("http://", "https://")):
+            if strip_remote_images:
+                # Opted into stripping ALL remote images (max privacy /
+                # no network dependence), at the cost of dropping real
+                # content images like logos too.
+                img.decompose()
+            elif _looks_like_tracking_pixel(img):
+                # Default: only drop images that actually look like
+                # tracking pixels/beacons; keep real content images (logos,
+                # decorative art) so the rendered receipt looks right. Note
+                # this does mean the renderer will contact the sender's
+                # server for these images each time you render.
+                img.decompose()
 
     # Strip all hyperlinks, keeping the visible text.
     for a in soup.find_all("a"):
@@ -363,7 +399,7 @@ def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
                 )
 
                 page.emulate_media(media="print")
-                page.pdf(path=str(out_path), print_background=True)
+                page.pdf(path=str(out_path), print_background=True, prefer_css_page_size=True)
             finally:
                 browser.close()
     except LiveRenderError:
@@ -402,9 +438,77 @@ def strip_pdf_link_annotations(pdf_path: Path):
 # PDF rendering + metadata
 # --------------------------------------------------------------------------
 
-def render_pdf(html: str, out_path: Path):
+_warned_no_playwright_for_email_render = False
+
+
+def render_pdf(html: str, out_path: Path, timeout_ms: int = 20000):
+    """Render an email's HTML body to PDF.
+
+    Prefers headless Chromium (via Playwright) because it has full CSS
+    support -- clip-path/mask, flexbox, web fonts, proper nested-table width
+    resolution -- which is what real POS receipt templates rely on to get
+    their layout (rounded/starred rating icons, a centered narrow "receipt
+    strip" on a colored background, etc). weasyprint's CSS engine doesn't
+    support all of that, so its output can diverge visually from what
+    Thunderbird (a real browser engine) shows for the same email.
+
+    Falls back to weasyprint if playwright isn't installed, so the tool
+    still works without the extra dependency -- just with lower fidelity
+    on visually elaborate templates.
+    """
+    global _warned_no_playwright_for_email_render
+    try:
+        _render_html_via_chromium(html, out_path, timeout_ms=timeout_ms)
+        return
+    except LiveRenderError as e:
+        if not _warned_no_playwright_for_email_render:
+            log.warning(
+                "Falling back to weasyprint for email-HTML rendering (%s). "
+                "For higher-fidelity output matching what Thunderbird shows, run "
+                "'pip install --break-system-packages playwright && playwright install chromium'.",
+                e,
+            )
+            _warned_no_playwright_for_email_render = True
+
     from weasyprint import HTML
     HTML(string=html, base_url=None).write_pdf(str(out_path))
+
+
+def _render_html_via_chromium(html: str, out_path: Path, timeout_ms: int = 20000):
+    """Render a raw HTML string to PDF via headless Chromium. Raises
+    LiveRenderError (reusing the same type as the live-page renderer, since
+    the failure modes and the "just fall back" handling are identical) if
+    playwright isn't installed or the render fails outright."""
+    try:
+        from playwright.sync_api import sync_playwright, Error as PWError, TimeoutError as PWTimeout
+    except ImportError as e:
+        raise LiveRenderError("playwright is not installed") from e
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch()
+            except PWError as e:
+                raise LiveRenderError(f"could not launch chromium ({e})") from e
+            try:
+                page = browser.new_page()
+                try:
+                    page.set_content(html, wait_until="networkidle", timeout=timeout_ms)
+                except PWTimeout as e:
+                    raise LiveRenderError(f"timed out rendering HTML: {e}") from e
+                except PWError as e:
+                    raise LiveRenderError(f"failed to render HTML: {e}") from e
+                page.emulate_media(media="print")
+                page.pdf(path=str(out_path), print_background=True, prefer_css_page_size=True)
+            finally:
+                browser.close()
+    except LiveRenderError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise LiveRenderError(f"unexpected error rendering HTML: {e}") from e
+
+    if not out_path.exists() or out_path.stat().st_size < 500:
+        raise LiveRenderError("output PDF is missing or suspiciously small")
 
 
 def pdf_date(dt: datetime) -> str:
@@ -542,7 +646,7 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                         continue
                     try:
                         cleaned = clean_html(html, cid_map, strip_remote_images)
-                        render_pdf(cleaned, out_path)
+                        render_pdf(cleaned, out_path, timeout_ms=live_render_timeout_ms)
                         rendered = True
                     except Exception as e:  # noqa: BLE001
                         log.error("Failed to render %s: %s", out_path, e)
@@ -584,9 +688,15 @@ def main():
                      help="List matches without writing any PDFs or updating state")
     ap.add_argument("--force", action="store_true",
                      help="Reprocess messages even if already recorded in the state file")
-    ap.add_argument("--keep-remote-images", action="store_true",
-                     help="Do not strip remote (http/https) <img> tags. By default these "
-                          "are removed to avoid tracking pixels and network dependence.")
+    ap.add_argument("--block-remote-images", dest="strip_remote_images", action="store_true",
+                     default=False,
+                     help="Strip ALL remote (http/https) <img> tags, including real content "
+                          "images like logos, for maximum privacy/no network dependence at "
+                          "render time. By default only images that look like actual tracking "
+                          "pixels/beacons (0/1px, tracker-ish names) are dropped, and real "
+                          "content images are kept and fetched so the PDF looks like the "
+                          "actual receipt.")
+    ap.add_argument("--keep-remote-images", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--live-render", dest="live_render", action="store_true", default=True,
                      help="For matched receipts containing a link matching "
                           "live_receipt_link_patterns (e.g. squareup.com/r/...), load that "
@@ -633,6 +743,13 @@ def main():
     if not args.input or not args.output:
         ap.error("--input and --output are required (unless using --test-live-url)")
 
+    if args.keep_remote_images:
+        log.warning(
+            "--keep-remote-images is deprecated and has no effect: keeping real content "
+            "images (like logos) is now the default. Use --block-remote-images if you "
+            "want the old strip-everything-remote behavior."
+        )
+
     if args.live_render:
         try:
             import playwright.sync_api  # noqa: F401
@@ -661,7 +778,7 @@ def main():
             mbox_path, cfg, args.output, state,
             strict=args.strict,
             dry_run=args.dry_run,
-            strip_remote_images=not args.keep_remote_images,
+            strip_remote_images=args.strip_remote_images,
             force=args.force,
             live_render=args.live_render,
             live_render_timeout_ms=args.live_render_timeout,

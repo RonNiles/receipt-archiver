@@ -13,18 +13,20 @@ envelope line, so `.msf`/other junk is skipped automatically.
 ## Install
 
 ```bash
-pip3 install --break-system-packages beautifulsoup4 lxml weasyprint pikepdf
-```
-
-(weasyprint here is the newer pure-Python build -- no system Cairo/Pango/GTK
-libraries required. If your `pip3 install` pulls an older weasyprint that
-needs those, `sudo apt install libpango-1.0-0 libpangoft2-1.0-0` will cover it.)
-
-Optional, for live-rendering hosted receipt pages (see below):
-```bash
-pip3 install --break-system-packages playwright
+pip3 install --break-system-packages beautifulsoup4 lxml pikepdf playwright
 playwright install chromium
 ```
+
+Email HTML is now rendered through headless Chromium (Playwright), the same
+engine used for the live-render feature below -- this matches Thunderbird's
+own rendering fidelity (full CSS: clip-path/mask, flexbox, web fonts, proper
+nested-table width resolution) far better than a pure-Python CSS engine can.
+`weasyprint` is kept as an optional lower-fidelity fallback (`pip3 install
+--break-system-packages weasyprint`) used automatically only if playwright
+isn't installed at all -- so the tool still works without the browser
+dependency, just with less accurate output on visually elaborate templates
+(e.g. star-rating icons drawn with clip-path will render as plain filled
+shapes instead of stars).
 
 ## Usage
 
@@ -48,10 +50,13 @@ lands) only picks up new mail. Use `--force` to reprocess everything.
   subject-keyword fallback. Use this if you're getting false positives.
 - `--config path.json` -- point at a customized copy of `senders.json` to add
   more POS vendors or subject keywords.
-- `--keep-remote-images` -- by default, remote (http/https) `<img>` tags are
-  stripped since they're almost always tracking pixels or hotlinked logos;
-  pass this to keep them (note: doing so makes the PDF depend on network
-  access at render time and may load a tracking pixel).
+- `--block-remote-images` -- strip ALL remote (http/https) `<img>` tags,
+  including real content images like logos, for maximum privacy / no network
+  dependence at render time. By default, only images that look like actual
+  tracking pixels/beacons (0/1px, tracker-ish class/id/filename) are dropped;
+  real content images (logos, decorative art) are kept and fetched so the
+  PDF actually looks like the receipt. Note this does mean rendering an
+  email will contact the sender's server for those images each time.
 - `--live-render` / `--no-live-render` -- see below. On by default.
 - `--live-render-timeout MS` -- how long to wait for the live receipt page to
   load (default 20000ms).
