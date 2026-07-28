@@ -88,15 +88,19 @@ matched receipt's body contains a link matching one of the
 page in a real headless browser and prints *that* to PDF instead of the
 email's own HTML.
 
-**Currently configured:** a SendGrid click-tracking pattern
-(`u<digits>.ct.sendgrid.net/ls/click?...`), which covers Clover's "full
-transaction receipt" link and any other vendor that routes its receipt link
-through SendGrid the same way. These are redirect links -- SendGrid logs
-the click, then 302s to the vendor's actual hosted page -- and Playwright
-follows redirects automatically, so no special handling was needed for
-that part. Worth knowing: clicking through does mean SendGrid/the vendor
-logs that you opened and clicked the link, same tradeoff as fetching
-remote images (see above).
+**Currently configured:** two patterns, since Clover has sent both formats
+over time --
+- A SendGrid click-tracking redirect link
+  (`u<digits>.ct.sendgrid.net/ls/click?...`), used by newer receipts and any
+  other vendor that routes its receipt link through SendGrid the same way.
+  These are redirect links -- SendGrid logs the click, then 302s to the
+  vendor's actual hosted page -- and Playwright follows redirects
+  automatically, so no special handling was needed for that part. Worth
+  knowing: clicking through does mean SendGrid/the vendor logs that you
+  opened and clicked the link, same tradeoff as fetching
+  remote images (see above).
+- A direct `clover.com/p/<id>` link, used by older receipts -- no redirect
+  hop, Clover's own hosted receipt page directly.
 
 One wrinkle specific to plain-text email bodies: long URLs often get
 hard-wrapped (or soft-wrapped per RFC 3676 format=flowed, with a trailing
