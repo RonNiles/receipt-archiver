@@ -311,7 +311,46 @@ def _looks_like_tracking_pixel(img) -> bool:
     return any(m in haystack for m in ("track", "beacon", "pixel.gif", "open.gif", "spacer.gif"))
 
 
-def clean_html(html: str, cid_map: dict, strip_remote_images: bool) -> str:
+# --------------------------------------------------------------------------
+# Some receipts (seen so far: a couple of older Clover-style templates)
+# print no date anywhere in the visible body -- the only place it survives
+# is the email's Date header, which we already stamp into the PDF's
+# CreationDate/ModDate metadata, but that's not something anyone glances at
+# while reading a printed/exported receipt. If a heuristic scan of the
+# rendered text finds nothing date-shaped, we append a small footer line
+# with the email's date so it's visible on the page itself too.
+# --------------------------------------------------------------------------
+
+_MONTH_NAMES = (r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+                r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?")
+
+_DATE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"\b\d{4}-\d{1,2}-\d{1,2}\b",                          # 2026-06-08
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",                  # 6/8/26, 06-08-2026
+    rf"\b(?:{_MONTH_NAMES})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{2,4}}\b",   # June 8, 2026
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTH_NAMES})\.?,?\s+\d{{2,4}}\b",   # 8 June 2026
+)]
+
+
+def text_contains_date(text: str) -> bool:
+    """Best-effort heuristic: does this text have anything date-shaped in
+    it? False negatives (an unusual format we don't recognize) just mean a
+    redundant footer gets added, which is harmless; false positives (some
+    unrelated number sequence matching the shape of a date) mean we skip
+    adding a footer that would've been useful -- rare given the patterns
+    require date-like separators and groupings that ordinary receipt data
+    (phone numbers, prices, order numbers) doesn't happen to take."""
+    return any(p.search(text) for p in _DATE_PATTERNS)
+
+
+def format_date_footer_text(dt: datetime) -> str:
+    dt = dt.astimezone()  # local tz, same conversion pdf_date() uses for CreationDate/ModDate
+    offset = dt.strftime("%z")  # e.g. -0700
+    offset = f"UTC{offset[:3]}:{offset[3:]}" if offset else ""
+    return f"Email date: {dt.strftime('%B %d, %Y %I:%M %p')} {offset}".strip()
+
+
+def clean_html(html: str, cid_map: dict, strip_remote_images: bool, dt: datetime) -> str:
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "lxml")
@@ -350,6 +389,16 @@ def clean_html(html: str, cid_map: dict, strip_remote_images: bool) -> str:
         for attr in ("onclick",):
             if tag.has_attr(attr):
                 del tag[attr]
+
+    if not text_contains_date(soup.get_text()):
+        footer = soup.new_tag("div")
+        footer["style"] = (
+            "margin-top:12px; padding-top:8px; border-top:1px solid #ccc; "
+            "font-family:sans-serif; font-size:11px; color:#666; text-align:center;"
+        )
+        footer.string = format_date_footer_text(dt)
+        target = soup.body if soup.body else soup
+        target.append(footer)
 
     return str(soup)
 
@@ -448,7 +497,7 @@ _LIVE_RENDER_UA = (
 )
 
 
-def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
+def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: int = 20000,
                              min_text_chars: int = 40):
     """Load `url` in headless Chromium, strip hyperlinks directly in the
     live DOM (so the exported PDF has none, regardless of whether the site's
@@ -518,6 +567,27 @@ def render_live_receipt_pdf(url: str, out_path: Path, timeout_ms: int = 20000,
                         });
                     }"""
                 )
+
+                # If the hosted page has no date visible anywhere (seen on
+                # a couple of older receipt templates), append one so it's
+                # not only recoverable from PDF metadata.
+                current_text = page.inner_text("body") if page.query_selector("body") else ""
+                if not text_contains_date(current_text):
+                    page.evaluate(
+                        """(footerText) => {
+                            const footer = document.createElement('div');
+                            footer.textContent = footerText;
+                            footer.style.marginTop = '12px';
+                            footer.style.paddingTop = '8px';
+                            footer.style.borderTop = '1px solid #ccc';
+                            footer.style.fontFamily = 'sans-serif';
+                            footer.style.fontSize = '11px';
+                            footer.style.color = '#666';
+                            footer.style.textAlign = 'center';
+                            document.body.appendChild(footer);
+                        }""",
+                        format_date_footer_text(dt),
+                    )
 
                 page.emulate_media(media="print")
                 _print_fit_to_one_legal_page(page, out_path)
@@ -756,7 +826,7 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 if live_url:
                     try:
                         log.info("  live-rendering %s", live_url)
-                        render_live_receipt_pdf(live_url, out_path, timeout_ms=live_render_timeout_ms)
+                        render_live_receipt_pdf(live_url, out_path, dt, timeout_ms=live_render_timeout_ms)
                         rendered = True
                     except LiveRenderError as e:
                         log.warning("  live render failed (%s), falling back to email HTML", e)
@@ -766,7 +836,7 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                         log.error("  no email HTML to fall back to for %s, skipping", msg_id)
                         continue
                     try:
-                        cleaned = clean_html(html, cid_map, strip_remote_images)
+                        cleaned = clean_html(html, cid_map, strip_remote_images, dt)
                         render_pdf(cleaned, out_path, timeout_ms=live_render_timeout_ms)
                         rendered = True
                     except Exception as e:  # noqa: BLE001
@@ -853,7 +923,8 @@ def main():
             out_path = out_path / "live_render_test.pdf"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            render_live_receipt_pdf(args.test_live_url, out_path, timeout_ms=args.live_render_timeout)
+            render_live_receipt_pdf(args.test_live_url, out_path, datetime.now(timezone.utc),
+                                     timeout_ms=args.live_render_timeout)
         except LiveRenderError as e:
             log.error("Live render test FAILED: %s", e)
             sys.exit(1)

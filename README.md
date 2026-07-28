@@ -158,6 +158,27 @@ For each receipt, the tool measures the actual rendered content height and:
   single page, even if that means it's technically not Legal-sized in that
   edge case.
 
+## Missing-date footer
+
+A couple of receipt templates (seen so far: some older Clover receipts)
+print no date anywhere in the visible body -- the only place it survives is
+the email's `Date` header, which gets stamped into the PDF's
+CreationDate/ModDate metadata but isn't something you'd notice while
+reading a printed/exported receipt.
+
+Before rendering, the tool scans the receipt's text for anything
+date-shaped (`2026-06-08`, `6/8/26`, `June 8, 2026`, `8 June 2026`, etc.).
+If nothing matches, it appends a small footer line at the bottom of the
+page:
+```
+Email date: June 08, 2026 07:33 PM UTC-07:00
+```
+using the same date that's in the PDF metadata. This is a text-based check
+(it can't see a date baked into an image, if a template ever does that) and
+a heuristic rather than exhaustive, so an unusual format it doesn't
+recognize just means a harmless redundant footer gets added -- it never
+removes or second-guesses a date that's already there.
+
 ## Notes / edge cases handled
 
 - Inline images referenced via `cid:` (common for receipt logos) are resolved
