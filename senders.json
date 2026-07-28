@@ -42,7 +42,7 @@
 
   "_live_receipt_comment": "If an email body contains a link matching one of these patterns, receipt_archiver can optionally load that page in a real (headless) browser and render THAT page to PDF instead of the email's own HTML. Most POS emails now render fine on their own since email HTML goes through Chromium (see render_pdf) -- but some (e.g. Clover) send a genuinely bare-bones email with no line-item detail at all, and only the linked 'full transaction receipt' page has it. Requires the 'playwright' package and 'playwright install chromium'. See --live-render / --no-live-render.",
   "live_receipt_link_patterns": [
-    "https?://u\\d+\\.ct\\.sendgrid\\.net(?::\\d+)?/ls/click\\?[^\\s<>]+"
+    "https?://u\\d+\\.ct\\.sendgrid\\.net(?::\\d+)?/ls/click\\?[^\\s<>\"']+"
   ],
 
   "require_html_body": true

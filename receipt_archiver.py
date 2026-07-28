@@ -201,48 +201,80 @@ def get_html_and_inline_images(msg: Message):
     return html, cid_map
 
 
-def get_all_text_content(msg: Message) -> str:
-    """Concatenate every text/plain and text/html part's decoded content.
-    Used only for scanning for a 'full receipt' link -- not for rendering."""
-    chunks = []
+def get_text_content_by_type(msg: Message) -> dict:
+    """Return {'text/plain': '...', 'text/html': '...'} of decoded content
+    (parts of the same type are concatenated together). Used only for
+    scanning for a 'full receipt' link -- not for rendering."""
+    chunks = {"text/plain": [], "text/html": []}
     parts = msg.walk() if msg.is_multipart() else [msg]
     for part in parts:
-        if part.get_content_type() in ("text/plain", "text/html"):
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                continue
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                chunks.append(payload.decode(charset, errors="replace"))
-            except (LookupError, TypeError):
-                chunks.append(payload.decode("utf-8", errors="replace"))
-    return "\n".join(chunks)
+        ctype = part.get_content_type()
+        if ctype not in chunks:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            chunks[ctype].append(payload.decode(charset, errors="replace"))
+        except (LookupError, TypeError):
+            chunks[ctype].append(payload.decode("utf-8", errors="replace"))
+    return {k: "\n".join(v) for k, v in chunks.items()}
+
+
+_URL_TRAILING_JUNK = re.compile(r'''[\s'")\]>.,;]+$''')
+
+
+def _clean_matched_url(url: str) -> str:
+    """Defensively trim characters that are clearly not part of a URL but
+    can get swept up by a regex match -- e.g. the closing quote of an HTML
+    href="...">, a trailing '>' from an angle-bracket-wrapped plain-text
+    link, or trailing prose punctuation. This is a safety net independent
+    of how tight any individual live_receipt_link_patterns regex is."""
+    return _URL_TRAILING_JUNK.sub("", url)
 
 
 def find_live_receipt_url(msg: Message, live_link_res):
     """If the message body contains a link matching one of the configured
     'live_receipt_link_patterns', return the first match. Otherwise None.
 
-    Plain-text email bodies commonly hard-wrap long lines (and
-    format=flowed bodies soft-wrap with a trailing space before the
-    newline), which can split a long URL across two lines. Matching against
-    the raw text would miss that, so this also tries a whitespace-collapsed
-    copy of the text -- safe to do because URLs never legitimately contain
-    whitespace, so collapsing it can only help reassemble a wrapped URL, and
-    can't turn unrelated prose into a false positive (the patterns all
-    require a specific https?://... prefix).
+    Plain-text and HTML bodies are searched separately (plain-text first)
+    rather than as one concatenated blob: concatenating them let a failed
+    match against a wrapped plain-text URL fall through into an unrelated,
+    unwrapped occurrence of the same link inside the HTML part's
+    href="...">, which could swallow the closing quote as if it were part
+    of the URL. HTML entities (e.g. &amp; in a multi-parameter query
+    string) are unescaped before matching against the HTML body, and any
+    match is run through _clean_matched_url() as a final safety net.
+
+    Plain-text bodies commonly hard-wrap long lines (and format=flowed
+    bodies soft-wrap with a trailing space before the newline), which can
+    split a long URL across two lines. Matching against the raw text would
+    miss that, so each body is also tried with whitespace collapsed --
+    safe to do because URLs never legitimately contain whitespace, so
+    collapsing it can only help reassemble a wrapped URL, and can't turn
+    unrelated prose into a false positive (the patterns all require a
+    specific https?://... prefix).
     """
     if not live_link_res:
         return None
-    text = get_all_text_content(msg)
-    collapsed = re.sub(r"\s+", "", text)
-    for pattern in live_link_res:
-        m = pattern.search(text)
-        if m:
-            return m.group(0)
-        m = pattern.search(collapsed)
-        if m:
-            return m.group(0)
+
+    import html as html_module
+
+    by_type = get_text_content_by_type(msg)
+    candidates = [
+        by_type.get("text/plain", ""),
+        html_module.unescape(by_type.get("text/html", "")),
+    ]
+
+    for body in candidates:
+        if not body:
+            continue
+        for variant in (body, re.sub(r"\s+", "", body)):
+            for pattern in live_link_res:
+                m = pattern.search(variant)
+                if m:
+                    return _clean_matched_url(m.group(0))
     return None
 
 
