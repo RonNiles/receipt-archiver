@@ -13,7 +13,7 @@ envelope line, so `.msf`/other junk is skipped automatically.
 ## Install
 
 ```bash
-pip3 install --break-system-packages beautifulsoup4 lxml pikepdf playwright
+pip3 install --break-system-packages beautifulsoup4 lxml pikepdf playwright python-dateutil
 playwright install chromium
 ```
 
@@ -60,7 +60,9 @@ lands) only picks up new mail. Use `--force` to reprocess everything.
 - `--live-render` / `--no-live-render` -- see below. On by default.
 - `--live-render-timeout MS` -- how long to wait for the live receipt page to
   load (default 20000ms).
-- `--test-live-url URL` -- debug helper, see below.
+- `--receipt-url URL` -- render a single receipt link directly (e.g. one
+  texted to you), see below.
+- `--date DATE` -- date override for --receipt-url, see below.
 - `--dry-run` -- list matches without writing PDFs or touching the state file.
 - `--force` -- reprocess messages even if already recorded in the state file.
 - `-v` -- verbose logging.
@@ -133,11 +135,88 @@ detail like Clover's, add a regex for its link to
   startup and every match uses the email-HTML path -- nothing breaks.
 
 **Testing before a big run:** sanity-check the pipeline against one real
-link first, rather than running the whole archive:
+link first, rather than running the whole archive -- see `--receipt-url`
+just below, which works for this too.
+
+## Rendering a receipt link directly (e.g. one texted to you)
+
+Sometimes a receipt link shows up somewhere other than an archived email --
+texted to you, in a Slack DM, wherever. `--receipt-url` runs that single
+link through the exact same rendering pipeline as the main archive scan
+(single Legal-size page fit to content, no clickable links, real-content
+images kept, missing-date footer if needed) and writes one PDF.
+
+All PDF rendering, including this, forces Chromium's "screen" CSS media
+instead of the default "print". Real hosted web pages -- unlike raw email
+HTML, which almost never bothers with this -- commonly ship an actual
+`@media print` stylesheet that strips decorative styling (colors, icons,
+backgrounds) to save ink on paper. Left at the default, that stylesheet
+would kick in and the PDF would look noticeably plainer than the rich page
+you'd see in a normal browser tab; forcing "screen" media keeps the real
+styling.
+
+One side effect of that: forcing "screen" media can also un-hide site-level
+chrome that a page's own print stylesheet would normally suppress -- most
+commonly a navigation bar (Toast's own receipt pages, for example, wrap
+their logo in `<div class="navbar navbar-inverse navbar-fixed-top">`,
+nested a couple of levels inside `<body>`) sitting above the actual
+receipt. Three checks run before printing, in order of reliability:
+
+1. Elements matching known nav/banner markers -- `<nav>`, `role="navigation"`,
+   `role="banner"`, or a class containing `"navbar"`. This is unconditional
+   on content, even if the element contains a real logo image: an actual
+   site nav bar is never legitimate receipt content regardless of what's in
+   it, and doesn't depend on the element actually computing to CSS
+   `position: fixed` at render time -- which turns out not to be reliable
+   (responsive breakpoints and stylesheet timing can mean a real nav bar
+   computes to `position: static` in headless rendering even though it's
+   visually a fixed top bar in a normal browser -- confirmed against
+   Toast's real markup). Deliberately *not* a bare `<header>` tag, though --
+   that's ambiguous enough (a receipt could legitimately use it for the
+   business's own name/address block) that including it caused real receipt
+   content to disappear in testing.
+2. Any `position: fixed`/`sticky` element anchored near the top, for chrome
+   that isn't caught by the selector match above.
+3. Among the first few direct children of `<body>` specifically, anything
+   with a solid background but no visible text and no image -- catches
+   decorative empty bars that don't match either check above.
+
 ```bash
-python3 receipt_archiver.py --test-live-url "PASTE_THE_FULL_LINK_HERE" -o ./test.pdf
+python3 receipt_archiver.py --receipt-url "https://www.toasttab.com/receipts/PGPK4uf-Q9igP7LrasiqJA/yW9cK7NfYsXgY" -o ~/receipts/manual/toast-2026-03-13.pdf
 ```
-This loads that one URL, strips links, prints to PDF, and exits.
+
+If `-o` isn't given, it writes `receipt.pdf` in the current directory.
+
+**Date handling:** unlike the main scan, there's no email `Date` header to
+draw from here, so the date used for the PDF metadata and (if needed) the
+footer is auto-detected from the page's own visible text (same date-shape
+patterns as the missing-date footer feature, fed through dateutil's fuzzy
+parser). If the page doesn't have a recognizable date anywhere, it falls
+back to the time you ran the command and the footer says so explicitly
+(`PDF rendered: ... (actual receipt date not found on page)`) rather than
+presenting a guess as the real receipt date. Use `--date` if you know the
+actual date and don't want to rely on auto-detection:
+```bash
+python3 receipt_archiver.py --receipt-url "https://..." --date "March 13, 2026 5:44pm" -o ./receipt.pdf
+```
+`--date` accepts pretty much any format a human would write
+(`2026-03-13 17:44`, `3/13/26 5:44pm`, `March 13, 2026`, ...) via dateutil.
+
+Requires `python-dateutil` in addition to the playwright/pikepdf
+dependencies already needed for live rendering:
+```bash
+pip3 install --break-system-packages python-dateutil
+```
+
+**Debugging a specific page:** if a `--receipt-url` render looks wrong
+(missing content, unwanted chrome, odd layout) and you want to see exactly
+what our headless Chromium renders -- not what `curl` would show, which is
+the pre-JavaScript source and can be very different for a client-rendered
+page -- `--dump-dom` loads a URL the same way `--receipt-url` does and
+saves the fully-hydrated page HTML to a file instead of printing a PDF:
+```bash
+python3 receipt_archiver.py --dump-dom "https://..." -o ./dom_dump.html
+```
 
 ## Page sizing (single page, no near-empty overflow page)
 

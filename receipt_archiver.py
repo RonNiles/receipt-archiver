@@ -32,6 +32,7 @@ import mailbox
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 from email.errors import HeaderParseError
 from email.header import decode_header
@@ -456,7 +457,14 @@ def _print_fit_to_one_legal_page(page, out_path: Path):
     """Print `page`'s already-loaded content to a single Legal-size PDF
     page, shrinking it (never enlarging) just enough that it doesn't spill
     onto a second page."""
-    page.emulate_media(media="print")
+    # Chromium's page.pdf() defaults to "print" CSS media. Real hosted web
+    # pages (unlike raw email HTML, which essentially never defines
+    # print-specific overrides) commonly ship an actual @media print
+    # stylesheet that strips decorative styling to save ink when someone
+    # prints the page on paper -- colored backgrounds, icons, etc. removed.
+    # We want the rich on-screen look, not the bare-bones print version, so
+    # explicitly force "screen" media instead.
+    page.emulate_media(media="screen")
     content_height_px = page.evaluate("document.documentElement.scrollHeight")
     content_height_in = content_height_px / CSS_PX_PER_IN
     printable_height_in = LEGAL_MAX_HEIGHT_IN - 2 * PDF_MARGIN_IN
@@ -497,12 +505,70 @@ _LIVE_RENDER_UA = (
 )
 
 
-def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: int = 20000,
+def extract_date_from_text(text: str):
+    """Best-effort: find an actual datetime.datetime in receipt page text,
+    for standalone URL rendering where there's no email Date header to draw
+    from. Only lines that already look date-shaped (per the same patterns
+    text_contains_date() uses) are handed to dateutil's fuzzy parser, so an
+    unrelated number sequence elsewhere on the page can't get misread as a
+    date -- the regex pre-filter is the safety gate. Returns None if
+    dateutil isn't installed or nothing on the page parses cleanly."""
+    try:
+        from dateutil import parser as dateutil_parser
+    except ImportError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not any(p.search(line) for p in _DATE_PATTERNS):
+            continue
+        try:
+            parsed = dateutil_parser.parse(line, fuzzy=True)
+        except (ValueError, OverflowError, TypeError):
+            continue
+        if 2000 <= parsed.year <= 2100:  # reject obviously-wrong fuzzy parses
+            return parsed
+    return None
+
+
+def dump_rendered_dom(url: str, timeout_ms: int = 20000) -> str:
+    """Load `url` exactly the way render_live_receipt_pdf does (same
+    viewport, user agent, wait strategy) and return the fully-hydrated
+    page.content() -- i.e. what our headless Chromium actually sees after
+    JS runs, not the pre-JS source `curl` would return. Meant for debugging
+    what a heuristic like the chrome-bar stripper is (or isn't) matching
+    against; see --dump-dom."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        try:
+            context = browser.new_context(user_agent=_LIVE_RENDER_UA, viewport=_legal_page_viewport())
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            # Match the extra hydration-tolerance buffer used elsewhere.
+            page.wait_for_timeout(1500)
+            return page.content()
+        finally:
+            browser.close()
+
+
+def render_live_receipt_pdf(url: str, out_path: Path, dt=None, timeout_ms: int = 20000,
                              min_text_chars: int = 40):
     """Load `url` in headless Chromium, strip hyperlinks directly in the
     live DOM (so the exported PDF has none, regardless of whether the site's
     printed output would otherwise carry link annotations), then print the
     page to `out_path`.
+
+    `dt`: the date to use for the missing-date footer (and, via the
+    caller, PDF metadata). Pass a known datetime (e.g. from an email's Date
+    header) to use it as-is. Pass None to auto-detect a date from the
+    page's own visible text instead (dateutil fuzzy-parses lines that look
+    date-shaped) -- meant for standalone URL rendering (see --test-live-url)
+    where there's no email to draw a date from. If auto-detection can't
+    find anything, falls back to the current time and always adds a footer
+    noting the real date is unknown, rather than presenting a guess as fact.
+
+    Returns (resolved_dt, page_title) so a caller in auto-detect mode can
+    use them for its own PDF metadata stamping.
 
     Raises LiveRenderError on any failure (missing playwright/browser,
     navigation failure, or a page that rendered suspiciously little text --
@@ -519,6 +585,7 @@ def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: 
             "or use --no-live-render"
         ) from e
 
+    page_title = ""
     try:
         with sync_playwright() as p:
             try:
@@ -556,6 +623,95 @@ def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: 
                         "likely blocked, expired, or requires JS this browser didn't run"
                     )
 
+                try:
+                    page_title = page.title() or ""
+                except PWError:
+                    page_title = ""
+
+                date_was_auto_detected = dt is None
+                if dt is None:
+                    dt = extract_date_from_text(body_text)
+                    if dt is not None:
+                        log.info("  auto-detected receipt date from page content: %s", dt.isoformat())
+                    else:
+                        dt = datetime.now(timezone.utc)
+                        log.warning(
+                            "  could not determine a reliable date from the page content; using "
+                            "render time (%s) as a placeholder for PDF metadata -- pass --date "
+                            "if you know the real one",
+                            dt.isoformat(),
+                        )
+
+                # Forcing "screen" media (see _print_fit_to_one_legal_page)
+                # restores real page styling, but can also un-hide site-level
+                # chrome -- a nav bar, promo banner, etc. -- that the site's
+                # own @media print rules would normally suppress on a real
+                # printout.
+                #
+                # Primary check: elements matching known nav/banner markers
+                # -- <nav>, role="navigation"/"banner", or a class
+                # containing "navbar" (e.g. Toast's own receipt pages use
+                # <body><div class="wrapper"><div class="navbar
+                # navbar-fixed-top">...containing their logo<img>...). This
+                # is unconditional on content (even if it contains a real
+                # logo image) because an actual site nav bar is never
+                # legitimate receipt content regardless of what's in it --
+                # real receipt content (line items, totals, business info)
+                # lives in the page's own receipt/card container, not in
+                # navigation markup. Deliberately NOT bare <header> --
+                # that's ambiguous enough (a business could legitimately use
+                # it for its own name/address block) that stripping it
+                # caused real receipt content to disappear in testing.
+                # This also doesn't depend on
+                # the element actually being CSS position:fixed at render
+                # time, which isn't reliable -- responsive breakpoints,
+                # stylesheet load timing, etc. can all mean a real nav bar
+                # computes to position:static in our headless render even
+                # though it's visually a fixed top bar in a normal browser.
+                #
+                # Secondary check: any position:fixed/sticky element
+                # anchored near the top of the page, for chrome that isn't
+                # caught by the selector match above (unknown vendors,
+                # different markup conventions).
+                #
+                # Tertiary check: among the first few top-level children of
+                # <body> specifically, anything with a solid background but
+                # no visible text and no image/logo -- catches decorative
+                # empty bars that aren't fixed-positioned and don't match
+                # known nav selectors either.
+                page.evaluate(
+                    """() => {
+                        document.querySelectorAll(
+                            'nav, [role="navigation"], [role="banner"], [class*="navbar"]'
+                        ).forEach(el => {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.top <= 300) el.style.display = 'none';
+                        });
+
+                        document.querySelectorAll('*').forEach(el => {
+                            const style = getComputedStyle(el);
+                            if (style.position !== 'fixed' && style.position !== 'sticky') return;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height <= 0) return;
+                            if (rect.top > 150) return;  // not anchored near the top
+                            el.style.display = 'none';
+                        });
+
+                        const candidates = Array.from(document.body.children).slice(0, 4);
+                        for (const el of candidates) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height < 8) continue;
+                            const text = (el.innerText || '').replace(/\\s+/g, '');
+                            if (text.length > 0) continue;
+                            if (el.querySelector('img, svg, picture')) continue;
+                            const bg = getComputedStyle(el).backgroundColor;
+                            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                                el.style.display = 'none';
+                            }
+                        }
+                    }"""
+                )
+
                 # Unwrap every <a> in the live DOM before printing, so the
                 # exported PDF has no clickable link constructs at all.
                 page.evaluate(
@@ -570,9 +726,16 @@ def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: 
 
                 # If the hosted page has no date visible anywhere (seen on
                 # a couple of older receipt templates), append one so it's
-                # not only recoverable from PDF metadata.
+                # not only recoverable from PDF metadata. If we had to fall
+                # back to "now" above, always add it (with honest wording),
+                # since in that case we know for certain the real date
+                # isn't shown anywhere on the page.
                 current_text = page.inner_text("body") if page.query_selector("body") else ""
-                if not text_contains_date(current_text):
+                needs_footer = not text_contains_date(current_text)
+                footer_text = format_date_footer_text(dt)
+                if date_was_auto_detected and needs_footer:
+                    footer_text = f"PDF rendered: {footer_text.replace('Email date: ', '')} (actual receipt date not found on page)"
+                if needs_footer:
                     page.evaluate(
                         """(footerText) => {
                             const footer = document.createElement('div');
@@ -586,10 +749,9 @@ def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: 
                             footer.style.textAlign = 'center';
                             document.body.appendChild(footer);
                         }""",
-                        format_date_footer_text(dt),
+                        footer_text,
                     )
 
-                page.emulate_media(media="print")
                 _print_fit_to_one_legal_page(page, out_path)
             finally:
                 browser.close()
@@ -600,6 +762,8 @@ def render_live_receipt_pdf(url: str, out_path: Path, dt: datetime, timeout_ms: 
 
     if not out_path.exists() or out_path.stat().st_size < 500:
         raise LiveRenderError(f"output PDF for {url} is missing or suspiciously small")
+
+    return dt, page_title
 
 
 def strip_pdf_link_annotations(pdf_path: Path):
@@ -689,7 +853,6 @@ def _render_html_via_chromium(html: str, out_path: Path, timeout_ms: int = 20000
                     raise LiveRenderError(f"timed out rendering HTML: {e}") from e
                 except PWError as e:
                     raise LiveRenderError(f"failed to render HTML: {e}") from e
-                page.emulate_media(media="print")
                 _print_fit_to_one_legal_page(page, out_path)
             finally:
                 browser.close()
@@ -900,12 +1063,28 @@ def main():
                      help="Disable live rendering; always use the email's own HTML.")
     ap.add_argument("--live-render-timeout", type=int, default=20000,
                      help="Milliseconds to wait for the live receipt page to load (default: 20000)")
-    ap.add_argument("--test-live-url", metavar="URL",
-                     help="Debug helper: render a single URL through the live-render "
-                          "pipeline (headless browser, strip links, print to PDF) and exit. "
-                          "Use this to sanity-check the feature against a real receipt link "
-                          "before running it over your whole archive. Combine with --output "
-                          "to choose where the test PDF is written.")
+    ap.add_argument("--receipt-url", "--test-live-url", dest="receipt_url", metavar="URL",
+                     help="Render a single receipt URL (e.g. one texted to you directly, not "
+                          "from an email) to a finished PDF and exit -- same pipeline as the "
+                          "main archive run: single Legal-size page fit to content, no "
+                          "clickable links, a date footer added if none is visible on the page. "
+                          "Since there's no email to pull a date from, the date is "
+                          "auto-detected from the page's own text; use --date to override or "
+                          "provide one if auto-detection can't find it. Combine with --output "
+                          "to choose where the PDF is written (defaults to the current "
+                          "directory).")
+    ap.add_argument("--date", metavar="DATE",
+                     help="Date to use for --receipt-url's PDF metadata/footer (e.g. "
+                          "'2026-03-13 17:44' or 'March 13, 2026 5:44pm'). Only used with "
+                          "--receipt-url; ignored otherwise. If omitted, the date is "
+                          "auto-detected from the page content.")
+    ap.add_argument("--dump-dom", metavar="URL",
+                     help="Debug helper: load URL exactly the way --receipt-url does (same "
+                          "viewport/user-agent/wait strategy) and write the fully-hydrated "
+                          "page HTML to disk, then exit -- no PDF, no rendering. Use this to "
+                          "see what our headless Chromium actually renders (post-JS), which "
+                          "is different from what plain curl would show for JS-heavy pages. "
+                          "Combine with --output to choose the file (default: dom_dump.html).")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -917,23 +1096,54 @@ def main():
     for noisy in ("fontTools", "weasyprint"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    if args.test_live_url:
-        out_path = (args.output if args.output else Path("live_render_test.pdf"))
+    if args.dump_dom:
+        out_path = (args.output if args.output else Path("dom_dump.html"))
         if out_path.is_dir() or not out_path.suffix:
-            out_path = out_path / "live_render_test.pdf"
+            out_path = out_path / "dom_dump.html"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            render_live_receipt_pdf(args.test_live_url, out_path, datetime.now(timezone.utc),
-                                     timeout_ms=args.live_render_timeout)
-        except LiveRenderError as e:
-            log.error("Live render test FAILED: %s", e)
+            html = dump_rendered_dom(args.dump_dom, timeout_ms=args.live_render_timeout)
+        except Exception as e:  # noqa: BLE001
+            log.error("Could not load %s: %s", args.dump_dom, e)
             sys.exit(1)
+        out_path.write_text(html, encoding="utf-8")
+        log.info("Dumped rendered DOM -> %s (%d bytes)", out_path, len(html))
+        return
+
+    if args.receipt_url:
+        out_path = (args.output if args.output else Path("receipt.pdf"))
+        if out_path.is_dir() or not out_path.suffix:
+            out_path = out_path / "receipt.pdf"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        explicit_dt = None
+        if args.date:
+            try:
+                from dateutil import parser as dateutil_parser
+                explicit_dt = dateutil_parser.parse(args.date)
+            except ImportError:
+                log.error("--date requires python-dateutil: pip install --break-system-packages python-dateutil")
+                sys.exit(1)
+            except (ValueError, OverflowError) as e:
+                log.error("Could not parse --date %r: %s", args.date, e)
+                sys.exit(1)
+
+        try:
+            resolved_dt, page_title = render_live_receipt_pdf(
+                args.receipt_url, out_path, explicit_dt, timeout_ms=args.live_render_timeout
+            )
+        except LiveRenderError as e:
+            log.error("Rendering %s FAILED: %s", args.receipt_url, e)
+            sys.exit(1)
+
         strip_pdf_link_annotations(out_path)
-        log.info("Live render test OK -> %s", out_path)
+        domain = urllib.parse.urlparse(args.receipt_url).netloc
+        stamp_pdf_metadata(out_path, resolved_dt, page_title or domain, domain)
+        log.info("Rendered -> %s (%s)", out_path, resolved_dt.isoformat())
         return
 
     if not args.input or not args.output:
-        ap.error("--input and --output are required (unless using --test-live-url)")
+        ap.error("--input and --output are required (unless using --receipt-url)")
 
     if args.keep_remote_images:
         log.warning(
