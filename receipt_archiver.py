@@ -202,6 +202,25 @@ def get_html_and_inline_images(msg: Message):
     return html, cid_map
 
 
+def get_pdf_attachment(msg: Message):
+    """Return the decoded bytes of the first PDF attachment found in the
+    message, or None. Some receipts (GitHub's monthly payment receipts,
+    for example) are delivered as a PDF attachment with no HTML body at
+    all -- this lets those get archived directly instead of being skipped."""
+    if not msg.is_multipart():
+        return None
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        filename = hstr(part.get_filename())
+        is_pdf = content_type == "application/pdf" or filename.lower().endswith(".pdf")
+        if not is_pdf:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload:
+            return payload
+    return None
+
+
 def get_text_content_by_type(msg: Message) -> dict:
     """Return {'text/plain': '...', 'text/html': '...'} of decoded content
     (parts of the same type are concatenated together). Used only for
@@ -969,10 +988,11 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 dt = get_message_datetime(msg, mtime)
 
                 html, cid_map = get_html_and_inline_images(msg)
+                pdf_attachment = get_pdf_attachment(msg) if html is None else None
 
                 live_url = find_live_receipt_url(msg, cfg["live_receipt_link_res"]) if live_render else None
 
-                if html is None and live_url is None:
+                if html is None and live_url is None and pdf_attachment is None:
                     log.info("MATCH (no HTML body, skipped) | %s | %s | %s", dt.isoformat(), from_header, subject)
                     continue
 
@@ -995,20 +1015,47 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                         log.warning("  live render failed (%s), falling back to email HTML", e)
 
                 if not rendered:
-                    if html is None:
-                        log.error("  no email HTML to fall back to for %s, skipping", msg_id)
-                        continue
-                    try:
-                        cleaned = clean_html(html, cid_map, strip_remote_images, dt)
-                        render_pdf(cleaned, out_path, timeout_ms=live_render_timeout_ms)
-                        rendered = True
-                    except Exception as e:  # noqa: BLE001
-                        log.error("Failed to render %s: %s", out_path, e)
+                    if html is not None:
+                        try:
+                            cleaned = clean_html(html, cid_map, strip_remote_images, dt)
+                            render_pdf(cleaned, out_path, timeout_ms=live_render_timeout_ms)
+                            rendered = True
+                        except Exception as e:  # noqa: BLE001
+                            log.error("Failed to render %s: %s", out_path, e)
+                            continue
+                    elif pdf_attachment is not None:
+                        try:
+                            out_path.write_bytes(pdf_attachment)
+                            rendered = True
+                        except OSError as e:
+                            log.error("Failed to write attached PDF to %s: %s", out_path, e)
+                            continue
+                    else:
+                        log.error("  no email HTML or PDF attachment to fall back to for %s, skipping", msg_id)
                         continue
 
                 try:
                     strip_pdf_link_annotations(out_path)
                     stamp_pdf_metadata(out_path, dt, subject, from_header)
+                    if pdf_attachment is not None and html is None:
+                        # Unlike the browser-rendered paths, there's no live
+                        # DOM to inject a footer into here -- the file is
+                        # already a finished PDF. Best-effort check only:
+                        # warn if it doesn't look like it has a date on it,
+                        # rather than silently leaving a possibly-undated
+                        # attachment in the archive.
+                        try:
+                            from pypdf import PdfReader
+                            attachment_text = "\n".join(
+                                (p.extract_text() or "") for p in PdfReader(str(out_path)).pages
+                            )
+                            if not text_contains_date(attachment_text):
+                                log.warning(
+                                    "  attached PDF for %s has no visible date detected in its text "
+                                    "(metadata date is still set from the email)", msg_id,
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("  could not check attached PDF for a visible date: %s", e)
                 except Exception as e:  # noqa: BLE001
                     log.error("Failed to finalize %s: %s", out_path, e)
                     continue

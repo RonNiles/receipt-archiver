@@ -269,8 +269,17 @@ removes or second-guesses a date that's already there.
   strings (a stdlib quirk on some encoded/folded headers), and encoded-word
   headers with corrupted base64/quoted-printable payloads, are both handled
   without crashing.
-- If a matched message has no HTML part and no live-render link, it's logged
-  but not rendered (nothing to convert).
+- If a matched message has an HTML body, that's used. If not, but it has a
+  PDF attachment (GitHub's monthly payment receipts, for example, arrive
+  this way -- no HTML body at all, just an attached PDF), the attachment is
+  archived directly: copied to the standard output path, links stripped,
+  and PDF metadata (CreationDate/ModDate/Title/Author) stamped from the
+  email the same as every other receipt. There's no live DOM to inject a
+  missing-date footer into for this path, so instead the attachment's text
+  is checked and a warning is logged if no date is found in it (the
+  metadata date from the email is set either way). If a message has neither
+  an HTML body nor a PDF attachment, it's logged but not rendered (nothing
+  to convert).
 - Timezone in the original `Date` header is preserved in the PDF's
   CreationDate/ModDate (same instant, just expressed with the render
   machine's local UTC offset -- this doesn't change *when* the receipt was
