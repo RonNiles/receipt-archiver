@@ -55,11 +55,13 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("sender_patterns", [])
     cfg.setdefault("exclude_sender_patterns", [])
     cfg.setdefault("prefer_attachment_senders", [])
+    cfg.setdefault("forwarder_senders", [])
     cfg.setdefault("subject_keywords", [])
     cfg.setdefault("live_receipt_link_patterns", [])
     cfg["sender_patterns"] = [s.lower() for s in cfg["sender_patterns"]]
     cfg["exclude_sender_patterns"] = [s.lower() for s in cfg["exclude_sender_patterns"]]
     cfg["prefer_attachment_senders"] = [s.lower() for s in cfg["prefer_attachment_senders"]]
+    cfg["forwarder_senders"] = [s.lower() for s in cfg["forwarder_senders"]]
     cfg["subject_keywords"] = [s.lower() for s in cfg["subject_keywords"]]
     cfg["live_receipt_link_res"] = [re.compile(p) for p in cfg["live_receipt_link_patterns"]]
     return cfg
@@ -161,6 +163,84 @@ def is_receipt(msg: Message, cfg: dict, strict: bool) -> bool:
     if strict:
         return sender_hit
     return sender_hit or (sender_hit is False and subject_hit and looks_transactional(from_header))
+
+
+# Matches a header-style line inside a forwarded message's body, e.g.
+# "From: Square <receipts@messaging.squareup.com>" or "Sent: Friday, ...".
+# Covers Thunderbird/Outlook/Apple Mail/Gmail's differing inline-forward
+# header block conventions, which all boil down to a handful of
+# "Label: value" lines close together somewhere in the body.
+_FWD_HEADER_LINE = re.compile(r"^\s*(from|date|sent|subject|to)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def find_forwarded_original(msg: Message, cfg: dict):
+    """Scan the message body for an embedded forwarded-header block (the
+    standard "-------- Forwarded Message --------" / "Begin forwarded
+    message:" style every major mail client produces for an inline
+    forward) whose From: line matches one of our known sender_patterns.
+
+    Returns None if nothing matches, otherwise a dict with whichever of
+    'from' / 'subject' / 'date' could be recovered from the header block
+    (any of them may be None if not found nearby) -- the original sender,
+    subject, and date of the receipt being forwarded, as opposed to the
+    forwarding family member's own address/subject/send-time.
+    """
+    by_type = get_text_content_by_type(msg)
+    plain = by_type.get("text/plain", "")
+    html_text = ""
+    if by_type.get("text/html"):
+        try:
+            from bs4 import BeautifulSoup
+            html_text = BeautifulSoup(by_type["text/html"], "lxml").get_text("\n")
+        except Exception:  # noqa: BLE001
+            html_text = ""
+    lines = (plain + "\n" + html_text).splitlines()
+
+    for i, line in enumerate(lines):
+        m = _FWD_HEADER_LINE.match(line)
+        if not m or m.group(1).lower() != "from":
+            continue
+        from_value = m.group(2).strip()
+        if not any(pat in from_value.lower() for pat in cfg["sender_patterns"]):
+            continue
+
+        result = {"from": from_value, "subject": None, "date": None}
+        window = lines[max(0, i - 6): i + 7]
+        for wline in window:
+            wm = _FWD_HEADER_LINE.match(wline)
+            if not wm:
+                continue
+            label, value = wm.group(1).lower(), wm.group(2).strip()
+            if label == "subject" and result["subject"] is None:
+                result["subject"] = value
+            elif label in ("date", "sent") and result["date"] is None:
+                try:
+                    from dateutil import parser as dateutil_parser
+                    result["date"] = dateutil_parser.parse(value, fuzzy=True)
+                except (ImportError, ValueError, OverflowError):
+                    pass
+        return result
+    return None
+
+
+def classify_receipt(msg: Message, cfg: dict, strict: bool):
+    """Like is_receipt(), but also handles messages forwarded by a trusted
+    family member (see forwarder_senders in senders.json): if the direct
+    checks don't match but the sender is a configured forwarder and the
+    body contains an embedded forwarded-header block matching a known
+    sender, it still counts as a match. Returns (matched, forwarded_info)
+    where forwarded_info is the dict from find_forwarded_original() when
+    the match came via forwarding, else None."""
+    if is_receipt(msg, cfg, strict):
+        return True, None
+
+    from_header = hstr(msg.get("From")).lower()
+    if cfg["forwarder_senders"] and any(pat in from_header for pat in cfg["forwarder_senders"]):
+        forwarded = find_forwarded_original(msg, cfg)
+        if forwarded:
+            return True, forwarded
+
+    return False, None
 
 
 def looks_transactional(from_header: str) -> bool:
@@ -982,7 +1062,8 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 continue
 
             try:
-                if not is_receipt(msg, cfg, strict):
+                matched, forwarded = classify_receipt(msg, cfg, strict)
+                if not matched:
                     continue
 
                 msg_id = hstr(msg.get("Message-ID")) or f"{mbox_path}:{key}"
@@ -993,6 +1074,22 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 subject = decode_mime_header(msg.get("Subject")) or "(no subject)"
                 from_header = hstr(msg.get("From")) or "(unknown sender)"
                 dt = get_message_datetime(msg, mtime)
+
+                if forwarded:
+                    # Matched via a trusted forwarder (see forwarder_senders)
+                    # rather than directly -- prefer the embedded original
+                    # receipt's sender/subject/date over the forwarding
+                    # family member's own address/subject/send-time,
+                    # wherever we managed to recover them from the
+                    # forwarded header block.
+                    log.debug("  forwarded receipt: recovered %s", forwarded)
+                    if forwarded.get("from"):
+                        from_header = forwarded["from"]
+                    if forwarded.get("subject"):
+                        subject = forwarded["subject"]
+                    if forwarded.get("date"):
+                        fdt = forwarded["date"]
+                        dt = fdt if fdt.tzinfo is not None else fdt.astimezone()
 
                 html, cid_map = get_html_and_inline_images(msg)
 

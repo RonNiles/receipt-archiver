@@ -100,6 +100,29 @@ attachment is archived directly instead. This is separate from (and works
 alongside) the existing PDF-attachment fallback for senders with no HTML
 body at all, like GitHub's payment receipts -- see below.
 
+**Processing receipts forwarded by family members:** if someone forwards
+you a receipt, the outer `From` is their address, not the vendor's, so it
+won't match directly no matter what's in `sender_patterns`. Add their
+address to `forwarder_senders` in `senders.json` (e.g. `"mom@gmail.com"`)
+to handle this: for messages from a listed address that don't already
+match directly, the body is scanned for an embedded forwarded-header block
+-- the "-------- Forwarded Message --------" / "Begin forwarded message:"
+style block every mail client (Thunderbird, Gmail, Outlook, Apple Mail)
+produces for an inline forward -- whose own `From:` line matches a
+`sender_patterns` entry. When found, the archived receipt uses the
+*embedded original* sender, subject, and date instead of the forwarding
+person's own address, "Fwd:"-prefixed subject, and forward time, wherever
+those could be recovered from the header block -- so it's filed and dated
+as if it had arrived directly, not as of whenever it happened to get
+forwarded to you. `forwarder_senders` is empty by default; who you trust to
+forward you real receipts is personal, not something to guess at.
+
+The rendered PDF still shows the whole forward (any note the person added,
+plus the quoted original) rather than isolating just the receipt -- pulling
+out only the embedded portion would take much more parsing than recovering
+a few header values, and this keeps the useful part (correct filing/dating)
+without that complexity.
+
 ## Live-rendering a linked hosted receipt page
 
 Some POS emails are a thin wrapper around a "view your full receipt" link

@@ -39,6 +39,9 @@
     "staples.com"
   ],
 
+  "_forwarder_comment": "Email addresses of trusted people (usually family) whose forwarded messages should be checked for a receipt too. Only used as a fallback: if a message doesn't match directly (see sender_patterns/subject_keywords above), but it's From one of these addresses, the body is scanned for an embedded forwarded-header block (the '-------- Forwarded Message --------' / 'Begin forwarded message:' style block every mail client produces for an inline forward) whose own From: line matches a sender_pattern. When that's found, the archived receipt uses the embedded original sender/subject/date instead of the forwarding person's own address and send-time, wherever those could be recovered. Add specific addresses here, e.g. 'mom@gmail.com' -- left empty by default since forwarder trust is personal, not something to guess at.",
+  "forwarder_senders": [],
+
   "subject_keywords": [
     "receipt",
     "your receipt",
