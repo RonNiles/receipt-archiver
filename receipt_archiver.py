@@ -53,9 +53,11 @@ def load_config(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
     cfg.setdefault("sender_patterns", [])
+    cfg.setdefault("exclude_sender_patterns", [])
     cfg.setdefault("subject_keywords", [])
     cfg.setdefault("live_receipt_link_patterns", [])
     cfg["sender_patterns"] = [s.lower() for s in cfg["sender_patterns"]]
+    cfg["exclude_sender_patterns"] = [s.lower() for s in cfg["exclude_sender_patterns"]]
     cfg["subject_keywords"] = [s.lower() for s in cfg["subject_keywords"]]
     cfg["live_receipt_link_res"] = [re.compile(p) for p in cfg["live_receipt_link_patterns"]]
     return cfg
@@ -147,6 +149,9 @@ def get_message_datetime(msg: Message, fallback_mtime: float) -> datetime:
 def is_receipt(msg: Message, cfg: dict, strict: bool) -> bool:
     from_header = hstr(msg.get("From")).lower()
     subject = decode_mime_header(msg.get("Subject")).lower()
+
+    if any(pat in from_header for pat in cfg["exclude_sender_patterns"]):
+        return False
 
     sender_hit = any(pat in from_header for pat in cfg["sender_patterns"])
     subject_hit = any(kw in subject for kw in cfg["subject_keywords"])

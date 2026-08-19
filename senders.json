@@ -24,7 +24,13 @@
     "grubhub.com",
     "doordash.com",
     "ubereats.com",
-    "olo.com"
+    "olo.com",
+    "priceline.com"
+  ],
+
+  "_exclude_comment": "Checked first, before anything else: if the From header contains any of these, the message is never treated as a receipt, full stop -- even if it would otherwise match a sender_pattern above (e.g. paypal.com matches broadly, but PayPal's newsletter/marketing sends from news.paypal.com and shouldn't be archived as a receipt). Add more subdomains/addresses here as you spot noisy senders.",
+  "exclude_sender_patterns": [
+    "news.paypal.com"
   ],
 
   "subject_keywords": [

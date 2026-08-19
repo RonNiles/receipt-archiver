@@ -79,6 +79,15 @@ second condition exists so a random newsletter that happens to say "receipt"
 in its subject doesn't get swept in. Edit `senders.json` freely to tune this
 for your own inbox -- it's a plain JSON file, no code changes needed.
 
+**Excluding noisy senders:** `exclude_sender_patterns` in `senders.json` is
+checked first, before anything else -- if the `From` header matches one of
+these, the message is never treated as a receipt, even if it would
+otherwise match a broader `sender_patterns` entry. This is for cases like
+PayPal's marketing sending from `news.paypal.com`: `paypal.com` needs to
+stay in `sender_patterns` to catch real PayPal receipts, but that same
+broad match would otherwise sweep in PayPal's newsletter too. Add more
+subdomains/addresses here as you spot noisy senders slipping through.
+
 ## Live-rendering a linked hosted receipt page
 
 Some POS emails are a thin wrapper around a "view your full receipt" link
