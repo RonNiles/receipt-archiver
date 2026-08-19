@@ -460,6 +460,19 @@ def format_date_footer_text(dt: datetime) -> str:
 def clean_html(html: str, cid_map: dict, strip_remote_images: bool, dt: datetime) -> str:
     from bs4 import BeautifulSoup
 
+    # Force standards mode if the source HTML has no <!DOCTYPE>. Outlook
+    # (and Hotmail/Exchange, which generate the same markup) commonly
+    # forwards mail with no doctype at all plus a "div{height:100%!important}"
+    # reset rule meant only for Outlook's own quirky renderer -- in a real
+    # browser, missing doctype triggers quirks mode, which lets that
+    # percentage height cascade against the viewport instead of collapsing
+    # to 'auto' as it would in standards mode, stacking up as several inches
+    # of blank space above the actual content. Confirmed against a real
+    # forwarded receipt: adding just the doctype (no other change) fully
+    # eliminated the extra blank space.
+    if not html.lstrip().lower().startswith("<!doctype"):
+        html = "<!DOCTYPE html>\n" + html
+
     soup = BeautifulSoup(html, "lxml")
 
     # Resolve cid: image references to embedded data URIs.

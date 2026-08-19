@@ -306,6 +306,13 @@ removes or second-guesses a date that's already there.
 
 - Inline images referenced via `cid:` (common for receipt logos) are resolved
   to embedded data URIs so they render correctly in the PDF.
+- HTML with no `<!DOCTYPE html>` -- common in Outlook/Hotmail/Exchange
+  forwards, which often ship a `div{height:100%!important}` reset rule
+  meant only for Outlook's own renderer -- gets one injected before
+  rendering. Without it, that rule triggers quirks mode and cascades
+  against the viewport height, stacking up as several inches of blank
+  space above the actual content (confirmed against a real forwarded
+  receipt: adding just the doctype, no other change, fully eliminated it).
 - Malformed/unreadable individual messages, and any single message that
   throws an unexpected error partway through processing, are logged and
   skipped rather than aborting the whole scan.
