@@ -88,6 +88,18 @@ stay in `sender_patterns` to catch real PayPal receipts, but that same
 broad match would otherwise sweep in PayPal's newsletter too. Add more
 subdomains/addresses here as you spot noisy senders slipping through.
 
+**Preferring a PDF attachment over the HTML body:** some senders attach the
+actual receipt as a PDF but the HTML body is just marketing (Staples does
+this -- the email body is a "thanks for shopping, here's a coupon" wrapper
+around the real receipt attachment). By default, when a message has both,
+the HTML body is used and the attachment is ignored (this matches the
+common case where HTML *is* the receipt and any PDF attached alongside it
+is a supplementary copy). Add a sender to `prefer_attachment_senders` in
+`senders.json` to flip that priority for just that sender -- the PDF
+attachment is archived directly instead. This is separate from (and works
+alongside) the existing PDF-attachment fallback for senders with no HTML
+body at all, like GitHub's payment receipts -- see below.
+
 ## Live-rendering a linked hosted receipt page
 
 Some POS emails are a thin wrapper around a "view your full receipt" link

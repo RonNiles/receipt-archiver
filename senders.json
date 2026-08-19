@@ -25,12 +25,18 @@
     "doordash.com",
     "ubereats.com",
     "olo.com",
-    "priceline.com"
+    "priceline.com",
+    "staples.com"
   ],
 
   "_exclude_comment": "Checked first, before anything else: if the From header contains any of these, the message is never treated as a receipt, full stop -- even if it would otherwise match a sender_pattern above (e.g. paypal.com matches broadly, but PayPal's newsletter/marketing sends from news.paypal.com and shouldn't be archived as a receipt). Add more subdomains/addresses here as you spot noisy senders.",
   "exclude_sender_patterns": [
     "news.paypal.com"
+  ],
+
+  "_prefer_attachment_comment": "For these senders, if the message has BOTH an HTML body and a PDF attachment, the attachment is used instead of the HTML -- for cases like Staples, where the HTML body is just marketing wrapper and the actual receipt is the attached PDF. Doesn't affect senders not in this list: their HTML is used as normal, falling back to a PDF attachment only if there's no HTML at all (see the GitHub payment-receipt case, which has no HTML body to begin with).",
+  "prefer_attachment_senders": [
+    "staples.com"
   ],
 
   "subject_keywords": [

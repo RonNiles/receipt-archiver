@@ -54,10 +54,12 @@ def load_config(path: Path) -> dict:
         cfg = json.load(fh)
     cfg.setdefault("sender_patterns", [])
     cfg.setdefault("exclude_sender_patterns", [])
+    cfg.setdefault("prefer_attachment_senders", [])
     cfg.setdefault("subject_keywords", [])
     cfg.setdefault("live_receipt_link_patterns", [])
     cfg["sender_patterns"] = [s.lower() for s in cfg["sender_patterns"]]
     cfg["exclude_sender_patterns"] = [s.lower() for s in cfg["exclude_sender_patterns"]]
+    cfg["prefer_attachment_senders"] = [s.lower() for s in cfg["prefer_attachment_senders"]]
     cfg["subject_keywords"] = [s.lower() for s in cfg["subject_keywords"]]
     cfg["live_receipt_link_res"] = [re.compile(p) for p in cfg["live_receipt_link_patterns"]]
     return cfg
@@ -993,7 +995,17 @@ def process_mbox_file(mbox_path: Path, cfg: dict, out_root: Path, state: dict,
                 dt = get_message_datetime(msg, mtime)
 
                 html, cid_map = get_html_and_inline_images(msg)
-                pdf_attachment = get_pdf_attachment(msg) if html is None else None
+
+                prefer_attachment = any(pat in from_header.lower() for pat in cfg["prefer_attachment_senders"])
+                pdf_attachment = None
+                if html is None or prefer_attachment:
+                    pdf_attachment = get_pdf_attachment(msg)
+                if prefer_attachment and pdf_attachment is not None:
+                    # A PDF attachment exists and this sender is configured
+                    # to prefer it -- e.g. Staples sends a marketing-heavy
+                    # HTML body alongside the actual receipt as an attached
+                    # PDF; the attachment is the one worth archiving.
+                    html = None
 
                 live_url = find_live_receipt_url(msg, cfg["live_receipt_link_res"]) if live_render else None
 
